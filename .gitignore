@@ -1,2 +1,6 @@
 # 数据集
 data/
+
+# 缓存
+experiment/__pycache__/
+tests/__pycache__/
