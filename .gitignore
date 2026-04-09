@@ -3,7 +3,12 @@ data/
 
 # 缓存
 experiment/__pycache__/
-tests/__pycache__/
+
+# 测试文件
+tests/
 
 # 工作痕迹
 plan/
+
+# 结果文件
+artifacts/
