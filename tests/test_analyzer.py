@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from math import ceil
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -40,6 +41,25 @@ class RollingTestAnalyzerTest(unittest.TestCase):
         self.horizons = [1, 2, 3]
         self.base_raw = self._build_raw(self.base_error, self.y_true)
         self.other_raw = self._build_raw(self.other_error, self.y_true)
+
+        self.summary_error = np.repeat(np.arange(1.0, 12.0).reshape(-1, 1), 2, axis=1)
+        self.summary_baseline_error = self.summary_error + 1.0
+        self.summary_baseline_error[0] = self.summary_error[0]
+        self.summary_y_true = np.full_like(self.summary_error, 10.0)
+        self.summary_origin_dates = [f"2024-03-{day:02d}" for day in range(1, 12)]
+        self.summary_horizons = [1, 2]
+        self.summary_raw = self._build_raw(
+            self.summary_error,
+            self.summary_y_true,
+            origin_dates=self.summary_origin_dates,
+            horizons=self.summary_horizons,
+        )
+        self.summary_baseline_raw = self._build_raw(
+            self.summary_baseline_error,
+            self.summary_y_true,
+            origin_dates=self.summary_origin_dates,
+            horizons=self.summary_horizons,
+        )
 
     def _build_raw(
         self,
@@ -81,30 +101,89 @@ class RollingTestAnalyzerTest(unittest.TestCase):
             eps=self.eps,
         )
 
-    def _manual_loss_matrix(
+    def _manual_overall_metrics(self, error: np.ndarray, y_true: np.ndarray) -> pd.Series:
+        ape = np.abs(error) / np.maximum(np.abs(y_true), self.eps)
+        metrics = pd.Series(
+            {
+                "MASE": np.mean(np.abs(error)) / self.mase_scale,
+                "RMSE": np.sqrt(np.mean(np.square(error))),
+                "WAPE(%)": np.sum(np.abs(error)) / np.maximum(np.sum(np.abs(y_true)), self.eps) * 100,
+                "Bias": np.mean(error),
+                "MAPE(%)": np.mean(ape) * 100,
+            },
+            dtype=float,
+            name="overall",
+        )
+        return metrics.loc[list(RollingTestAnalyzer.OVERALL_METRIC_COLUMNS)]
+
+    def _manual_horizon_loss_matrix(
+        self,
+        error: np.ndarray,
+        index: pd.Index,
+    ) -> pd.DataFrame:
+        losses = pd.DataFrame(
+            {
+                "MAE": np.mean(np.abs(error), axis=0),
+                "RMSE": np.sqrt(np.mean(np.square(error), axis=0)),
+                "Bias": np.mean(error, axis=0),
+            },
+            index=index,
+            dtype=float,
+        )
+        return losses.loc[:, list(RollingTestAnalyzer.HORIZON_METRIC_COLUMNS)]
+
+    def _manual_window_loss_matrix(
         self,
         error: np.ndarray,
         y_true: np.ndarray,
-        axis: int,
         index: pd.Index,
     ) -> pd.DataFrame:
         ape = np.abs(error) / np.maximum(np.abs(y_true), self.eps)
         losses = pd.DataFrame(
             {
-                "MASE": np.mean(np.abs(error), axis=axis) / self.mase_scale,
-                "RMSE": np.sqrt(np.mean(np.square(error), axis=axis)),
-                "WAPE": (
-                    np.sum(np.abs(error), axis=axis)
-                    / np.maximum(np.sum(np.abs(y_true), axis=axis), self.eps)
-                    * 100
-                ),
-                "Bias": np.mean(error, axis=axis),
-                "MAPE": np.mean(ape, axis=axis) * 100,
+                "MAE": np.mean(np.abs(error), axis=1),
+                "RMSE": np.sqrt(np.mean(np.square(error), axis=1)),
+                "MAPE(%)": np.mean(ape, axis=1) * 100,
             },
             index=index,
             dtype=float,
         )
-        return losses.loc[:, RollingTestAnalyzer.METRIC_COLUMNS]
+        return losses.loc[:, list(RollingTestAnalyzer.WINDOW_METRIC_COLUMNS)]
+
+    def _manual_window_summary(
+        self,
+        losses: pd.DataFrame,
+        baseline_losses: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
+        summary = pd.DataFrame(
+            {
+                "mean": losses.mean(axis=0),
+                "median": losses.median(axis=0),
+                "std": losses.std(axis=0, ddof=0),
+                "worst10%": losses.apply(
+                    lambda values: values.nlargest(max(1, ceil(len(values) * 0.1))).mean(),
+                    axis=0,
+                ),
+                "max": losses.max(axis=0),
+            },
+            dtype=float,
+        )
+        summary = summary.loc[
+            list(RollingTestAnalyzer.WINDOW_METRIC_COLUMNS),
+            list(RollingTestAnalyzer.WINDOW_SUMMARY_COLUMNS),
+        ]
+
+        if baseline_losses is not None:
+            win_rate = pd.Series(
+                {
+                    metric: float((losses[metric] < baseline_losses[metric]).mean())
+                    for metric in RollingTestAnalyzer.WINDOW_METRIC_COLUMNS
+                },
+                dtype=float,
+            )
+            summary["win_rate"] = win_rate.loc[list(RollingTestAnalyzer.WINDOW_METRIC_COLUMNS)]
+
+        return summary
 
     def test_builds_sorted_error_and_value_matrices(self) -> None:
         analyzer = self._build_analyzer(self.base_raw)
@@ -125,149 +204,86 @@ class RollingTestAnalyzerTest(unittest.TestCase):
 
     def test_overall_metrics_follow_expected_formulas(self) -> None:
         analyzer = self._build_analyzer(self.base_raw)
-        ape = np.abs(self.base_error) / np.abs(self.y_true)
-        expected = pd.Series(
-            {
-                "MASE": np.mean(np.abs(self.base_error)) / self.mase_scale,
-                "RMSE": np.sqrt(np.mean(np.square(self.base_error))),
-                "WAPE": np.sum(np.abs(self.base_error)) / np.sum(np.abs(self.y_true)) * 100,
-                "Bias": np.mean(self.base_error),
-                "MAPE": np.mean(ape) * 100,
-            },
-            dtype=float,
-            name="overall",
-        )
-        expected = expected.loc[list(RollingTestAnalyzer.METRIC_COLUMNS)]
+        expected = self._manual_overall_metrics(self.base_error, self.y_true)
 
         assert_series_equal(analyzer.overall_metrics(), expected, check_exact=False, atol=1e-12)
 
-    def test_loss_matrix_returns_horizon_and_window_views(self) -> None:
+    def test_loss_matrix_returns_scope_specific_views(self) -> None:
         analyzer = self._build_analyzer(self.base_raw)
-        expected_horizon = self._manual_loss_matrix(
+        expected_horizon = self._manual_horizon_loss_matrix(
             self.base_error,
-            self.y_true,
-            axis=0,
             index=pd.Index(self.horizons, name="horizon"),
         )
-        expected_window = self._manual_loss_matrix(
+        expected_window = self._manual_window_loss_matrix(
             self.base_error,
             self.y_true,
-            axis=1,
             index=pd.Index(self.origin_dates, name="origin_date"),
         )
 
+        actual_horizon = analyzer.loss_matrix("horizon")
+        actual_window = analyzer.loss_matrix("window")
+
+        self.assertEqual(actual_horizon.columns.tolist(), list(RollingTestAnalyzer.HORIZON_METRIC_COLUMNS))
+        self.assertEqual(actual_window.columns.tolist(), list(RollingTestAnalyzer.WINDOW_METRIC_COLUMNS))
+
+        assert_frame_equal(actual_horizon, expected_horizon, check_exact=False, atol=1e-12)
+        assert_frame_equal(actual_window, expected_window, check_exact=False, atol=1e-12)
+
+    def test_window_loss_summary_returns_expected_statistics(self) -> None:
+        analyzer = self._build_analyzer(self.summary_raw)
+        window_losses = self._manual_window_loss_matrix(
+            self.summary_error,
+            self.summary_y_true,
+            index=pd.Index(self.summary_origin_dates, name="origin_date"),
+        )
+        expected = self._manual_window_summary(window_losses)
+
         assert_frame_equal(
-            analyzer.loss_matrix("horizon"),
-            expected_horizon,
+            analyzer.loss_summary("window"),
+            expected,
             check_exact=False,
             atol=1e-12,
         )
-        assert_frame_equal(
-            analyzer.loss_matrix("window"),
-            expected_window,
-            check_exact=False,
-            atol=1e-12,
+
+    def test_window_loss_summary_with_baseline_adds_win_rate(self) -> None:
+        analyzer = self._build_analyzer(self.summary_raw)
+        baseline = self._build_analyzer(self.summary_baseline_raw)
+        window_losses = self._manual_window_loss_matrix(
+            self.summary_error,
+            self.summary_y_true,
+            index=pd.Index(self.summary_origin_dates, name="origin_date"),
         )
-
-    def test_loss_summary_matches_loss_matrix_aggregation(self) -> None:
-        analyzer = self._build_analyzer(self.base_raw)
-
-        for scope in ("horizon", "window"):
-            with self.subTest(scope=scope):
-                losses = analyzer.loss_matrix(scope)
-                expected = losses.agg(["min", "max", "mean", "median"]).T
-                expected["std"] = losses.std(axis=0, ddof=0)
-                expected = expected.loc[:, ["min", "max", "mean", "median", "std"]]
-                assert_frame_equal(
-                    analyzer.loss_summary(scope),
-                    expected,
-                    check_exact=False,
-                    atol=1e-12,
-                )
-
-    def test_overall_equals_mean_for_mase_bias_mape_only(self) -> None:
-        analyzer = self._build_analyzer(self.base_raw)
-        overall = analyzer.overall_metrics()
-        horizon_mean = analyzer.loss_matrix("horizon").mean(axis=0)
-        window_mean = analyzer.loss_matrix("window").mean(axis=0)
-
-        for metric in ("MASE", "Bias", "MAPE"):
-            with self.subTest(metric=metric):
-                self.assertAlmostEqual(overall[metric], horizon_mean[metric], places=12)
-                self.assertAlmostEqual(overall[metric], window_mean[metric], places=12)
-
-        self.assertGreater(abs(overall["RMSE"] - horizon_mean["RMSE"]), 1e-6)
-        self.assertGreater(abs(overall["RMSE"] - window_mean["RMSE"]), 1e-6)
-        self.assertGreater(abs(overall["WAPE"] - horizon_mean["WAPE"]), 1e-6)
-        self.assertGreater(abs(overall["WAPE"] - window_mean["WAPE"]), 1e-6)
-
-    def test_compare_winrate_uses_absolute_bias_and_counts_ties_as_zero(self) -> None:
-        analyzer_a = self._build_analyzer(self.base_raw)
-        analyzer_b = self._build_analyzer(self.other_raw)
-
-        for scope in ("horizon", "window"):
-            with self.subTest(scope=scope):
-                left = self._manual_loss_matrix(
-                    self.base_error,
-                    self.y_true,
-                    axis=0 if scope == "horizon" else 1,
-                    index=(
-                        pd.Index(self.horizons, name="horizon")
-                        if scope == "horizon"
-                        else pd.Index(self.origin_dates, name="origin_date")
-                    ),
-                )
-                right = self._manual_loss_matrix(
-                    self.other_error,
-                    self.y_true,
-                    axis=0 if scope == "horizon" else 1,
-                    index=(
-                        pd.Index(self.horizons, name="horizon")
-                        if scope == "horizon"
-                        else pd.Index(self.origin_dates, name="origin_date")
-                    ),
-                )
-
-                expected = {}
-                for metric in RollingTestAnalyzer.METRIC_COLUMNS:
-                    left_values = left[metric]
-                    right_values = right[metric]
-                    if metric == "Bias":
-                        left_values = left_values.abs()
-                        right_values = right_values.abs()
-                    expected[metric] = float((left_values < right_values).mean())
-
-                expected_series = pd.Series(
-                    expected,
-                    dtype=float,
-                    name=f"{scope}_winrate",
-                ).loc[list(RollingTestAnalyzer.METRIC_COLUMNS)]
-                actual = analyzer_a.compare_winrate(analyzer_b, scope)
-                assert_series_equal(actual, expected_series, check_exact=False, atol=1e-12)
-
-        self.assertEqual(analyzer_a.compare_winrate(analyzer_b, "horizon")["Bias"], 0.0)
-        self.assertEqual(analyzer_a.compare_winrate(analyzer_b, "window")["Bias"], 0.5)
-
-    def test_compare_winrate_requires_matching_indexes(self) -> None:
-        analyzer = self._build_analyzer(self.base_raw)
-
-        shifted_dates_raw = self._build_raw(
-            self.base_error,
-            self.y_true,
-            origin_dates=["2024-01-01", "2024-01-03"],
+        baseline_losses = self._manual_window_loss_matrix(
+            self.summary_baseline_error,
+            self.summary_y_true,
+            index=pd.Index(self.summary_origin_dates, name="origin_date"),
         )
-        shifted_dates_analyzer = self._build_analyzer(shifted_dates_raw)
+        expected = self._manual_window_summary(window_losses, baseline_losses)
+        actual = analyzer.loss_summary("window", baseline=baseline)
+
+        assert_frame_equal(actual, expected, check_exact=False, atol=1e-12)
+        self.assertAlmostEqual(actual.loc["MAE", "win_rate"], 10.0 / 11.0, places=12)
+        self.assertAlmostEqual(actual.loc["RMSE", "win_rate"], 10.0 / 11.0, places=12)
+        self.assertAlmostEqual(actual.loc["MAPE(%)", "win_rate"], 10.0 / 11.0, places=12)
+
+    def test_loss_summary_rejects_horizon_scope(self) -> None:
+        analyzer = self._build_analyzer(self.base_raw)
+
+        with self.assertRaisesRegex(ValueError, "Only window-wise loss summary is supported"):
+            analyzer.loss_summary("horizon")
+
+    def test_window_loss_summary_requires_matching_indexes(self) -> None:
+        analyzer = self._build_analyzer(self.summary_raw)
+        shifted_baseline_raw = self._build_raw(
+            self.summary_baseline_error,
+            self.summary_y_true,
+            origin_dates=[*self.summary_origin_dates[:-1], "2024-04-01"],
+            horizons=self.summary_horizons,
+        )
+        shifted_baseline = self._build_analyzer(shifted_baseline_raw)
+
         with self.assertRaisesRegex(ValueError, "different indexes"):
-            analyzer.compare_winrate(shifted_dates_analyzer, "window")
-
-        shifted_horizon_raw = self._build_raw(
-            self.base_error,
-            self.y_true,
-            horizons=[1, 2, 4],
-        )
-        shifted_horizon_analyzer = self._build_analyzer(shifted_horizon_raw)
-        with self.assertRaisesRegex(ValueError, "different indexes"):
-            analyzer.compare_winrate(shifted_horizon_analyzer, "horizon")
+            analyzer.loss_summary("window", baseline=shifted_baseline)
 
     def test_zero_targets_use_eps_safely(self) -> None:
         zero_error = np.array([[1.0, -1.0]])
@@ -302,10 +318,10 @@ class RollingTestAnalyzerTest(unittest.TestCase):
         )
 
         overall = analyzer.overall_metrics()
-        self.assertTrue(np.isfinite(overall["MAPE"]))
-        self.assertTrue(np.isfinite(overall["WAPE"]))
-        self.assertAlmostEqual(overall["MAPE"], (1.0 / self.eps) * 100, places=2)
-        self.assertAlmostEqual(overall["WAPE"], (2.0 / self.eps) * 100, places=2)
+        self.assertTrue(np.isfinite(overall["MAPE(%)"]))
+        self.assertTrue(np.isfinite(overall["WAPE(%)"]))
+        self.assertAlmostEqual(overall["MAPE(%)"], (1.0 / self.eps) * 100, places=2)
+        self.assertAlmostEqual(overall["WAPE(%)"], (2.0 / self.eps) * 100, places=2)
         np.testing.assert_allclose(analyzer.error, zero_error)
         np.testing.assert_allclose(analyzer.y_true, zero_true)
 
@@ -338,3 +354,4 @@ class RollingTestAnalyzerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

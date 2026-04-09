@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from math import ceil
 from os import PathLike
 
 import numpy as np
@@ -17,7 +18,10 @@ class RollingTestAnalyzer:
         "y_pred",
         "error",
     )
-    METRIC_COLUMNS = ("MASE", "RMSE", "WAPE", "Bias", "MAPE")
+    OVERALL_METRIC_COLUMNS = ("MASE", "RMSE", "WAPE(%)", "Bias", "MAPE(%)")
+    HORIZON_METRIC_COLUMNS = ("MAE", "RMSE", "Bias")
+    WINDOW_METRIC_COLUMNS = ("MAE", "RMSE", "MAPE(%)")
+    WINDOW_SUMMARY_COLUMNS = ("mean", "median", "std", "worst10%", "max")
 
     def __init__(
         self,
@@ -54,78 +58,108 @@ class RollingTestAnalyzer:
     def overall_metrics(self) -> pd.Series:
         metrics = pd.Series(
             {
-                "MASE": float(np.mean(np.abs(self.error)) / self.mase_scale),
+                "MASE": float(np.mean(self._absolute_error()) / self.mase_scale),
                 "RMSE": float(np.sqrt(np.mean(np.square(self.error)))),
-                "WAPE": float(
-                    np.sum(np.abs(self.error))
+                "WAPE(%)": float(
+                    np.sum(self._absolute_error())
                     / max(float(np.sum(np.abs(self.y_true))), self.eps)
                     * 100
                 ),
                 "Bias": float(np.mean(self.error)),
-                "MAPE": float(np.mean(self._absolute_percentage_error()) * 100),
+                "MAPE(%)": float(np.mean(self._absolute_percentage_error()) * 100),
             },
             dtype=float,
             name="overall",
         )
-        return metrics.loc[list(self.METRIC_COLUMNS)]
+        return metrics.loc[list(self.OVERALL_METRIC_COLUMNS)]
 
     def loss_matrix(self, scope: str) -> pd.DataFrame:
-        axis, index = self._resolve_scope(scope)
-        losses = pd.DataFrame(
+        if scope == "horizon":
+            return self._horizon_loss_matrix()
+        if scope == "window":
+            return self._window_loss_matrix()
+        raise ValueError("scope must be either 'horizon' or 'window'")
+
+    def loss_summary(
+        self,
+        scope: str,
+        baseline: "RollingTestAnalyzer | None" = None,
+    ) -> pd.DataFrame:
+        if scope != "window":
+            raise ValueError("Only window-wise loss summary is supported")
+
+        losses = self._window_loss_matrix()
+        summary = pd.DataFrame(
             {
-                "MASE": np.mean(np.abs(self.error), axis=axis) / self.mase_scale,
-                "RMSE": np.sqrt(np.mean(np.square(self.error), axis=axis)),
-                "WAPE": (
-                    np.sum(np.abs(self.error), axis=axis)
-                    / np.maximum(np.sum(np.abs(self.y_true), axis=axis), self.eps)
-                    * 100
-                ),
-                "Bias": np.mean(self.error, axis=axis),
-                "MAPE": np.mean(self._absolute_percentage_error(), axis=axis) * 100,
+                "mean": losses.mean(axis=0),
+                "median": losses.median(axis=0),
+                "std": losses.std(axis=0, ddof=0),
+                "worst10%": losses.apply(self._worst_ten_percent_mean, axis=0),
+                "max": losses.max(axis=0),
             },
-            index=index,
             dtype=float,
         )
-        return losses.loc[:, list(self.METRIC_COLUMNS)]
+        summary = summary.loc[
+            list(self.WINDOW_METRIC_COLUMNS),
+            list(self.WINDOW_SUMMARY_COLUMNS),
+        ]
 
-    def loss_summary(self, scope: str) -> pd.DataFrame:
-        losses = self.loss_matrix(scope)
-        summary = losses.agg(["min", "max", "mean", "median"]).T
-        summary["std"] = losses.std(axis=0, ddof=0)
-        return summary.loc[:, ["min", "max", "mean", "median", "std"]]
+        if baseline is not None:
+            summary["win_rate"] = self._window_win_rate(baseline)
 
-    def compare_winrate(self, other: "RollingTestAnalyzer", scope: str) -> pd.Series:
-        if not isinstance(other, RollingTestAnalyzer):
-            raise TypeError("other must be a RollingTestAnalyzer instance")
+        return summary
 
-        left = self.loss_matrix(scope)
-        right = other.loss_matrix(scope)
+    def _horizon_loss_matrix(self) -> pd.DataFrame:
+        losses = pd.DataFrame(
+            {
+                "MAE": np.mean(self._absolute_error(), axis=0),
+                "RMSE": np.sqrt(np.mean(np.square(self.error), axis=0)),
+                "Bias": np.mean(self.error, axis=0),
+            },
+            index=self.horizons,
+            dtype=float,
+        )
+        return losses.loc[:, list(self.HORIZON_METRIC_COLUMNS)]
+
+    def _window_loss_matrix(self) -> pd.DataFrame:
+        losses = pd.DataFrame(
+            {
+                "MAE": np.mean(self._absolute_error(), axis=1),
+                "RMSE": np.sqrt(np.mean(np.square(self.error), axis=1)),
+                "MAPE(%)": np.mean(self._absolute_percentage_error(), axis=1) * 100,
+            },
+            index=self.origin_dates,
+            dtype=float,
+        )
+        return losses.loc[:, list(self.WINDOW_METRIC_COLUMNS)]
+
+    def _window_win_rate(self, baseline: "RollingTestAnalyzer") -> pd.Series:
+        if not isinstance(baseline, RollingTestAnalyzer):
+            raise TypeError("baseline must be a RollingTestAnalyzer instance")
+
+        left = self._window_loss_matrix()
+        right = baseline._window_loss_matrix()
         if not left.index.equals(right.index):
             raise ValueError(
-                f"Cannot compare {scope}-wise losses with different indexes: "
+                "Cannot compare window-wise losses with different indexes: "
                 f"{left.index.tolist()} vs {right.index.tolist()}"
             )
 
-        winrate: dict[str, float] = {}
-        for metric in self.METRIC_COLUMNS:
-            left_values = left[metric]
-            right_values = right[metric]
-            if metric == "Bias":
-                left_values = left_values.abs()
-                right_values = right_values.abs()
-            winrate[metric] = float((left_values < right_values).mean())
+        wins = {
+            metric: float((left[metric] < right[metric]).mean())
+            for metric in self.WINDOW_METRIC_COLUMNS
+        }
+        return pd.Series(wins, dtype=float).loc[list(self.WINDOW_METRIC_COLUMNS)]
 
-        return pd.Series(winrate, dtype=float, name=f"{scope}_winrate").loc[list(self.METRIC_COLUMNS)]
+    def _absolute_error(self) -> np.ndarray:
+        return np.abs(self.error)
 
     def _absolute_percentage_error(self) -> np.ndarray:
-        return np.abs(self.error) / np.maximum(np.abs(self.y_true), self.eps)
+        return self._absolute_error() / np.maximum(np.abs(self.y_true), self.eps)
 
-    def _resolve_scope(self, scope: str) -> tuple[int, pd.Index]:
-        if scope == "horizon":
-            return 0, self.horizons
-        if scope == "window":
-            return 1, self.origin_dates
-        raise ValueError("scope must be either 'horizon' or 'window'")
+    def _worst_ten_percent_mean(self, values: pd.Series) -> float:
+        worst_count = max(1, ceil(len(values) * 0.1))
+        return float(values.nlargest(worst_count).mean())
 
     def _build_mase_scale(self) -> float:
         if len(self.history_actuals) <= self.seasonality:
@@ -245,4 +279,3 @@ class RollingTestAnalyzer:
         if not seasonality_value.is_integer() or seasonality_value <= 0:
             raise ValueError("seasonality must be a positive integer")
         return int(seasonality_value)
-

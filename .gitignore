@@ -4,3 +4,6 @@ data/
 # 缓存
 experiment/__pycache__/
 tests/__pycache__/
+
+# 工作痕迹
+plan/
