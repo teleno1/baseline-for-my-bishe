@@ -180,10 +180,16 @@ def plot_test_forecast(
             f"MAPE={worst_mape:.2f}%)"
         ),
     )
-    plt.title(
-        f"Rolling Test Forecast ({context.model_name})\n"
-        f"Horizon={context.run_config.horizon}, Mean Origin MAPE={overall_mape:.2f}%"
-    )
+    if context.model_spec.model_type == 'neural':
+        plt.title(
+            f"Rolling Test Forecast ({context.model_name})\n"
+            f"Loss Function:{context.run_config.neural_loss_name},Horizon={context.run_config.horizon}, Mean Origin MAPE={overall_mape:.2f}%"
+        )
+    else:
+        plt.title(
+            f"Rolling Test Forecast ({context.model_name})\n"
+            f"Horizon={context.run_config.horizon}, Mean Origin MAPE={overall_mape:.2f}%"
+        )
     plt.xlabel("Date")
     plt.ylabel("Daily Electricity Load")
     plt.legend()
