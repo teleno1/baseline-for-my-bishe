@@ -15,3 +15,6 @@ artifacts/
 
 # timellm的数据结果
 rolling_test_raw.csv
+
+# 记录
+my_notebook/
