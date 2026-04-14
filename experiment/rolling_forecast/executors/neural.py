@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,23 @@ def build_neural_loss(run_config: RunConfig):
 class NeuralExecutor(BaseExecutor):
     """神经网络执行器负责训练、checkpoint 恢复以及 val/test rolling 评估。"""
 
+    def _normalize_neural_params(self) -> dict[str, Any]:
+        neural_params = dict(self.context.model_spec.model_params)
+
+        if self.context.model_spec.model_cls.__name__ != "TimeLLM":
+            return neural_params
+
+        if importlib.util.find_spec("transformers") is None:
+            raise ImportError(
+                "TimeLLM requires the optional dependency `transformers`. "
+                "Install it before running TimeLLM experiments."
+            )
+
+        neural_params.setdefault("llm", "openai-community/gpt2")
+        neural_params.setdefault("enc_in", 1)
+        neural_params.setdefault("dec_in", 1)
+        return neural_params
+
     def run(self) -> ExecutorOutput:
         from neuralforecast import NeuralForecast
         from pytorch_lightning.callbacks import ModelCheckpoint
@@ -72,7 +90,7 @@ class NeuralExecutor(BaseExecutor):
             auto_insert_metric_name=False,
         )
 
-        neural_params = dict(self.context.model_spec.model_params)
+        neural_params = self._normalize_neural_params()
         neural_params.setdefault("alias", self.model_name)
         neural_params.setdefault("enable_progress_bar", False)
         neural_params.setdefault("enable_model_summary", False)
