@@ -63,3 +63,5 @@ class FinalizedPhase:
     diagnostics: dict[pd.Timestamp, dict[str, Any]]
     forecast_plot_path: Optional[str]
     rolling_raw_path: Optional[str]
+    overlay_plot_path: Optional[str]
+

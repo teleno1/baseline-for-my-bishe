@@ -102,6 +102,7 @@ class ExperimentResult:
     loss_plot_path: Optional[str]
     forecast_plot_path: Optional[str]
     rolling_raw_path: Optional[str]
+    overlay_plot_path: Optional[str]
     skipped: bool = False
     skip_reason: Optional[str] = None
     used_exog: bool = False
@@ -138,6 +139,7 @@ class ExperimentResult:
             loss_plot_path=None,
             forecast_plot_path=None,
             rolling_raw_path=None,
+            overlay_plot_path=None,
             skipped=True,
             skip_reason=reason,
             used_exog=False,
@@ -154,7 +156,9 @@ class ExperimentResult:
             "artifact_dir": self.artifact_dir,
             "best_model_path": self.best_model_path,
             "rolling_raw_path": self.rolling_raw_path,
+            "overlay_plot_path": self.overlay_plot_path,
         }
 
     def __repr__(self) -> str:
         return f"ExperimentResult({self.summary()})"
+

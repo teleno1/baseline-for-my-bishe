@@ -86,6 +86,7 @@ class RollingForecastRunner:
             loss_plot_path=output.loss_plot_path,
             forecast_plot_path=test_phase.forecast_plot_path,
             rolling_raw_path=test_phase.rolling_raw_path,
+            overlay_plot_path=test_phase.overlay_plot_path,
             skipped=False,
             skip_reason=None,
             used_exog=bool(hist_exog or futr_exog),
@@ -217,3 +218,4 @@ class RollingForecastRunner:
         artifact_dir = Path(self.run_config.save_dir) / run_tag / run_stamp
         artifact_dir.mkdir(parents=True, exist_ok=True)
         return artifact_dir
+
