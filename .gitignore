@@ -18,3 +18,8 @@ rolling_test_raw.csv
 
 # 记录
 my_notebook/
+
+# 分析脚本
+analyze_raw.ipynb
+plot_power_daily_raw.py
+rolling_test_overlay.ipynb
