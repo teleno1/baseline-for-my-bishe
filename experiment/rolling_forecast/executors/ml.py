@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from typing import Any
 
@@ -11,8 +11,6 @@ from .base import BaseExecutor
 
 
 class MLExecutor(BaseExecutor):
-    """机器学习模型按 train -> val -> test 的流程进行 rolling 评估。"""
-
     def run(self) -> ExecutorOutput:
         self._validate_single_series()
         model = self._fit_model()
@@ -61,9 +59,18 @@ class MLExecutor(BaseExecutor):
         target_start_idx: int,
     ) -> tuple[np.ndarray, np.ndarray]:
         input_size = self.context.run_config.input_size
-        feature_count = input_size + len(self.context.futr_exog)
+        feature_count = (
+            input_size
+            + input_size * len(self.context.hist_exog)
+            + len(self.context.futr_exog)
+        )
         y_values = df["y"].to_numpy(dtype=float)
-        exog_values = (
+        hist_exog_values = (
+            df[self.context.hist_exog].to_numpy(dtype=float)
+            if self.context.hist_exog
+            else None
+        )
+        futr_exog_values = (
             df[self.context.futr_exog].to_numpy(dtype=float)
             if self.context.futr_exog
             else None
@@ -76,8 +83,12 @@ class MLExecutor(BaseExecutor):
         y_rows: list[float] = []
         for idx in range(start_idx, len(df)):
             feature_row = y_values[idx - input_size : idx][::-1].tolist()
-            if exog_values is not None:
-                feature_row.extend(exog_values[idx].tolist())
+            if hist_exog_values is not None:
+                feature_row.extend(
+                    hist_exog_values[idx - input_size : idx][::-1].reshape(-1).tolist()
+                )
+            if futr_exog_values is not None:
+                feature_row.extend(futr_exog_values[idx].tolist())
             x_rows.append(feature_row)
             y_rows.append(float(y_values[idx]))
 
@@ -170,6 +181,7 @@ class MLExecutor(BaseExecutor):
         if len(history_values) < input_size:
             raise ValueError("Observed history is shorter than input_size.")
 
+        hist_exog_window = self._build_hist_exog_window(observed_df)
         future_exog = (
             future_df[self.context.futr_exog].to_numpy(dtype=float)
             if self.context.futr_exog
@@ -178,13 +190,23 @@ class MLExecutor(BaseExecutor):
         predictions: list[float] = []
         for step in range(len(future_df)):
             lag_features = np.asarray(history_values[-input_size:][::-1], dtype=float)
+            feature_parts = [lag_features]
+            if hist_exog_window is not None:
+                feature_parts.append(hist_exog_window)
             if future_exog is not None:
-                features = np.concatenate([lag_features, future_exog[step]])
-            else:
-                features = lag_features
+                feature_parts.append(future_exog[step])
+            features = np.concatenate(feature_parts)
             prediction = model.predict(features.reshape(1, -1))
             prediction_value = float(np.asarray(prediction).reshape(-1)[0])
             predictions.append(prediction_value)
             history_values.append(prediction_value)
 
         return np.asarray(predictions, dtype=float)
+
+    def _build_hist_exog_window(self, observed_df: pd.DataFrame) -> np.ndarray | None:
+        if not self.context.hist_exog:
+            return None
+
+        input_size = self.context.run_config.input_size
+        hist_exog_values = observed_df[self.context.hist_exog].to_numpy(dtype=float)
+        return np.asarray(hist_exog_values[-input_size:][::-1].reshape(-1), dtype=float)

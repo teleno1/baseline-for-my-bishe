@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -23,7 +23,8 @@ class RunConfig:
     horizon: int
     split_ratio: tuple[float, float, float] = (7, 1, 2)
     sliding_step_size: int = 1
-    use_exog: bool = True
+    use_hist_exog: bool = True
+    use_futr_exog: bool = True
     save_plots: bool = True
     random_seed: int = 42
     early_stop_patience_steps: int = 20
@@ -65,6 +66,10 @@ class RunConfig:
         total = float(sum(self.split_ratio))
         return tuple(value / total for value in self.split_ratio)
 
+    @property
+    def use_exog(self) -> bool:
+        return self.use_hist_exog or self.use_futr_exog
+
 
 @dataclass(frozen=True)
 class ModelSpec:
@@ -72,6 +77,7 @@ class ModelSpec:
     model_type: str
     model_cls: type
     model_params: dict[str, Any] = field(default_factory=dict)
+    supports_hist_exog: bool = True
     supports_future_exog: bool = True
 
     def __post_init__(self) -> None:

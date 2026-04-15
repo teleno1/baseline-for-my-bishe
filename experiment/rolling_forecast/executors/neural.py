@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
@@ -14,8 +14,6 @@ from .base import BaseExecutor
 
 
 def build_neural_loss(run_config: RunConfig):
-    """根据 RunConfig 构造 neuralforecast 使用的训练损失和验证损失对象。"""
-
     from neuralforecast.losses import pytorch as loss_module
 
     loss_registry = {
@@ -48,8 +46,6 @@ def build_neural_loss(run_config: RunConfig):
 
 
 class NeuralExecutor(BaseExecutor):
-    """神经网络执行器负责训练、checkpoint 恢复以及 val/test rolling 评估。"""
-
     def _normalize_neural_params(self) -> dict[str, Any]:
         neural_params = dict(self.context.model_spec.model_params)
 
@@ -101,6 +97,7 @@ class NeuralExecutor(BaseExecutor):
         model = self.context.model_spec.model_cls(
             h=self.context.run_config.horizon,
             input_size=self.context.run_config.input_size,
+            hist_exog_list=self.context.hist_exog,
             futr_exog_list=self.context.futr_exog,
             loss=build_neural_loss(self.context.run_config),
             valid_loss=build_neural_loss(self.context.run_config),

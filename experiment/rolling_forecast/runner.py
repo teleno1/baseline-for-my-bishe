@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
@@ -15,11 +15,10 @@ from .types import ExecutionContext, SplitData
 
 
 class RollingForecastRunner:
-    """rolling forecast 的统一实验入口，负责切分数据、选择执行器、运行评估并汇总结果。"""
-
     def __init__(self, prepared_dataset: PreparedDataset, run_config: RunConfig):
         self.prepared_dataset = PreparedDataset(
             df=prepared_dataset.df.sort_values(["unique_id", "ds"]).reset_index(drop=True),
+            hist_exog=list(prepared_dataset.hist_exog),
             futr_exog=list(prepared_dataset.futr_exog),
             csv_path=prepared_dataset.csv_path,
             unique_id=prepared_dataset.unique_id,
@@ -30,23 +29,22 @@ class RollingForecastRunner:
         if self._should_skip(model_spec):
             return ExperimentResult.skipped_result(
                 model_name=model_spec.name,
-                reason=(
-                    f"{model_spec.name} does not support future exogenous variables "
-                    "while RunConfig.use_exog=True."
-                ),
+                reason=self._skip_reason(model_spec),
                 requested_use_exog=self.run_config.use_exog,
             )
 
+        hist_exog = self._resolve_hist_exog(model_spec)
         futr_exog = self._resolve_future_exog(model_spec)
         split_data = self._split_dataset(self.prepared_dataset.df)
         artifact_dir = self._create_artifact_dir(
             model_name=run_name or model_spec.name,
-            used_exog=bool(futr_exog),
+            feature_tag=self._feature_tag(hist_exog=hist_exog, futr_exog=futr_exog),
         )
         context = ExecutionContext(
             dataset=self.prepared_dataset,
             run_config=self.run_config,
             model_spec=model_spec,
+            hist_exog=hist_exog,
             futr_exog=futr_exog,
             future_cols=["unique_id", "ds"] + futr_exog,
             artifact_dir=artifact_dir,
@@ -90,7 +88,7 @@ class RollingForecastRunner:
             rolling_raw_path=test_phase.rolling_raw_path,
             skipped=False,
             skip_reason=None,
-            used_exog=bool(futr_exog),
+            used_exog=bool(hist_exog or futr_exog),
             requested_use_exog=self.run_config.use_exog,
             val_diagnostics=val_phase.diagnostics,
             diagnostics=test_phase.diagnostics,
@@ -102,8 +100,6 @@ class RollingForecastRunner:
         )
 
     def _build_executor(self, context: ExecutionContext) -> BaseExecutor:
-        """根据模型类型构造对应的执行器实例。"""
-
         executor_map: dict[str, type[BaseExecutor]] = {
             "stats": StatsExecutor,
             "ml": MLExecutor,
@@ -112,15 +108,44 @@ class RollingForecastRunner:
         return executor_map[context.model_spec.model_type](context=context)
 
     def _should_skip(self, model_spec: ModelSpec) -> bool:
+        if model_spec.model_type not in {"ml", "neural"}:
+            return False
+
+        requested_hist_exog = self.run_config.use_hist_exog and bool(self.prepared_dataset.hist_exog)
+        requested_futr_exog = self.run_config.use_futr_exog and bool(self.prepared_dataset.futr_exog)
         return (
-            self.run_config.use_exog
-            and bool(self.prepared_dataset.futr_exog)
-            and model_spec.model_type in {"ml", "neural"}
-            and not model_spec.supports_future_exog
+            (requested_hist_exog and not model_spec.supports_hist_exog)
+            or (requested_futr_exog and not model_spec.supports_future_exog)
         )
 
+    def _skip_reason(self, model_spec: ModelSpec) -> str:
+        unsupported: list[str] = []
+        if self.run_config.use_hist_exog and bool(self.prepared_dataset.hist_exog):
+            if not model_spec.supports_hist_exog:
+                unsupported.append("historical exogenous variables (RunConfig.use_hist_exog=True)")
+        if self.run_config.use_futr_exog and bool(self.prepared_dataset.futr_exog):
+            if not model_spec.supports_future_exog:
+                unsupported.append("future exogenous variables (RunConfig.use_futr_exog=True)")
+
+        if not unsupported:
+            return f"{model_spec.name} was skipped."
+        if len(unsupported) == 1:
+            unsupported_text = unsupported[0]
+        else:
+            unsupported_text = " and ".join(unsupported)
+        return f"{model_spec.name} does not support {unsupported_text}."
+
+    def _resolve_hist_exog(self, model_spec: ModelSpec) -> list[str]:
+        if not self.run_config.use_hist_exog:
+            return []
+        if model_spec.model_type not in {"ml", "neural"}:
+            return []
+        if not model_spec.supports_hist_exog:
+            return []
+        return list(self.prepared_dataset.hist_exog)
+
     def _resolve_future_exog(self, model_spec: ModelSpec) -> list[str]:
-        if not self.run_config.use_exog:
+        if not self.run_config.use_futr_exog:
             return []
         if model_spec.model_type not in {"ml", "neural"}:
             return []
@@ -128,9 +153,18 @@ class RollingForecastRunner:
             return []
         return list(self.prepared_dataset.futr_exog)
 
-    def _split_dataset(self, df: pd.DataFrame) -> SplitData:
-        """按 train / val / test 顺序切分数据，并为 val 和 test 构造 rolling 起点。"""
+    def _feature_tag(self, hist_exog: list[str], futr_exog: list[str]) -> str:
+        has_hist_exog = bool(hist_exog)
+        has_futr_exog = bool(futr_exog)
+        if has_hist_exog and has_futr_exog:
+            return "both_feat"
+        if has_hist_exog:
+            return "hist_feat"
+        if has_futr_exog:
+            return "futr_feat"
+        return "no_feat"
 
+    def _split_dataset(self, df: pd.DataFrame) -> SplitData:
         n_total = len(df)
         train_ratio, _, test_ratio = self.run_config.normalized_split_ratio()
         n_train = int(n_total * train_ratio)
@@ -177,11 +211,9 @@ class RollingForecastRunner:
             )
         return origins
 
-    def _create_artifact_dir(self, model_name: str, used_exog: bool) -> Path:
-        """为当前模型运行创建独立的 artifact 目录。"""
-
+    def _create_artifact_dir(self, model_name: str, feature_tag: str) -> Path:
         run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_tag = f"{model_name}_{'feat' if used_exog else 'no_feat'}"
+        run_tag = f"{model_name}_{feature_tag}"
         artifact_dir = Path(self.run_config.save_dir) / run_tag / run_stamp
         artifact_dir.mkdir(parents=True, exist_ok=True)
         return artifact_dir
