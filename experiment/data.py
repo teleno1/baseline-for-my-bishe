@@ -52,6 +52,23 @@ class DatasetBuilder:
         return normalized
 
     @staticmethod
+    def remove_last_days(
+        df: pd.DataFrame,
+        date_col: str,
+        days: int,
+    ) -> pd.DataFrame:
+        normalized = DatasetBuilder.normalize_columns(df)
+        ds = pd.to_datetime(normalized[date_col])
+        trim_start = ds.max() - pd.Timedelta(days=days - 1)
+        trimmed_df = df.loc[ds < trim_start].copy()
+        if trimmed_df.empty:
+            raise ValueError(
+                f"Removing the last {days} days leaves an empty dataset. "
+                "Provide more history or disable remove_last_month."
+            )
+        return trimmed_df
+
+    @staticmethod
     def build_neuralforecast_df(
         df: pd.DataFrame,
         unique_id: str,
@@ -114,10 +131,17 @@ class DatasetBuilder:
         target_col: str = "OT",
         futr_exog: Optional[list[str]] = None,
         hist_exog: Optional[list[str]] = None,
+        remove_last_month: bool = False,
         verbose: bool = True,
         dropna: bool = True,
     ) -> PreparedDataset:
         raw_df = pd.read_csv(csv_path)
+        if remove_last_month:
+            raw_df = cls.remove_last_days(
+                df=raw_df,
+                date_col=date_col,
+                days=30,
+            )
         normalized_df = cls.normalize_columns(raw_df)
 
         if hist_exog is None and futr_exog is None:
