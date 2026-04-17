@@ -15,6 +15,7 @@ artifacts/
 
 # timellm的数据结果
 rolling_test_raw.csv
+timellm/
 
 # 记录
 my_notebook/
@@ -23,3 +24,4 @@ my_notebook/
 analyze_raw.ipynb
 plot_power_daily_raw.py
 rolling_test_overlay.ipynb
+analyze_raw.ipynb
