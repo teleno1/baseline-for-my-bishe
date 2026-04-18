@@ -2,6 +2,9 @@
 data/
 
 # 缓存
+__pycache__/
+*.py[cod]
+*$py.class
 experiment/__pycache__/
 experiment/rolling_forecast/__pycache__/
 experiment/rolling_forecast/executors/__pycache__/

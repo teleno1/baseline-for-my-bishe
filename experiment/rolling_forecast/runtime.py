@@ -12,18 +12,26 @@ def suppress_lightning_logs():
     """临时降低 Lightning 的日志级别，避免训练输出在 notebook 或终端中过于冗长。"""
 
     lightning_logger = logging.getLogger("lightning")
+    lightning_pytorch_logger = logging.getLogger("lightning.pytorch")
+    lightning_fabric_logger = logging.getLogger("lightning_fabric")
     pl_logger = logging.getLogger("pytorch_lightning")
 
     old_lightning_level = lightning_logger.level
+    old_lightning_pytorch_level = lightning_pytorch_logger.level
+    old_lightning_fabric_level = lightning_fabric_logger.level
     old_pl_level = pl_logger.level
 
     lightning_logger.setLevel(logging.ERROR)
+    lightning_pytorch_logger.setLevel(logging.ERROR)
+    lightning_fabric_logger.setLevel(logging.ERROR)
     pl_logger.setLevel(logging.ERROR)
 
     try:
         yield
     finally:
         lightning_logger.setLevel(old_lightning_level)
+        lightning_pytorch_logger.setLevel(old_lightning_pytorch_level)
+        lightning_fabric_logger.setLevel(old_lightning_fabric_level)
         pl_logger.setLevel(old_pl_level)
 
 

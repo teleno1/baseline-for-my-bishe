@@ -27,12 +27,11 @@ class RunConfig:
     use_futr_exog: bool = True
     save_plots: bool = True
     random_seed: int = 42
-    early_stop_patience_steps: int = 20
-    val_check_steps: int = 10
+    early_stop_patience_epochs: int = 20
     ml_early_stopping_rounds: Optional[int] = 20
     neural_loss_name: str = "MAPE"
     neural_loss_params: dict[str, Any] = field(default_factory=dict)
-    neural_test_checkpoint_mode: str = "best"
+    neural_checkpoint_mode: str = "last"
     save_dir: str = "./artifacts"
     plot_forecast: bool = True
     plot_loss: bool = True
@@ -49,10 +48,8 @@ class RunConfig:
             raise ValueError("split_ratio must contain exactly three values")
         if any(value <= 0 for value in self.split_ratio):
             raise ValueError("split_ratio values must be positive")
-        if self.early_stop_patience_steps < -1:
-            raise ValueError("early_stop_patience_steps must be >= -1")
-        if self.val_check_steps <= 0:
-            raise ValueError("val_check_steps must be positive")
+        if self.early_stop_patience_epochs < -1:
+            raise ValueError("early_stop_patience_epochs must be >= -1")
         if self.ml_early_stopping_rounds is not None and self.ml_early_stopping_rounds < 0:
             raise ValueError("ml_early_stopping_rounds must be >= 0 or None")
         if self.neural_loss_name not in SUPPORTED_NEURAL_LOSS_NAMES:
@@ -62,8 +59,8 @@ class RunConfig:
             )
         if not isinstance(self.neural_loss_params, dict):
             raise ValueError("neural_loss_params must be a dict")
-        if self.neural_test_checkpoint_mode not in {"best", "last"}:
-            raise ValueError("neural_test_checkpoint_mode must be 'best' or 'last'")
+        if self.neural_checkpoint_mode not in {"last", "val_best"}:
+            raise ValueError("neural_checkpoint_mode must be 'last' or 'val_best'")
 
     def normalized_split_ratio(self) -> tuple[float, float, float]:
         total = float(sum(self.split_ratio))

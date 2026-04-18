@@ -424,37 +424,47 @@ def build_loss_artifact(
     """Build the training-loss artifact from the Lightning metrics CSV."""
 
     metrics_df = pd.read_csv(metrics_csv_path)
-    step_col = "step" if "step" in metrics_df.columns else None
+    x_col = "epoch" if "epoch" in metrics_df.columns else None
+    if x_col is None and "step" in metrics_df.columns:
+        x_col = "step"
+    x_label = "Epoch" if x_col == "epoch" else "Step"
     train_col = choose_metric_column(
         metrics_df,
         ["train_loss_epoch", "train_loss", "ptl/train_loss", "train_loss_step"],
     )
     valid_col = choose_metric_column(
         metrics_df,
-        ["valid_loss", "ptl/val_loss", "val_loss"],
+        ["ptl/val_loss_norm", "ptl/val_loss", "valid_loss", "val_loss"],
     )
     test_col = choose_metric_column(
         metrics_df,
-        ["ptl/test_loss", "test_loss"],
+        ["ptl/test_loss_norm", "ptl/test_loss", "test_loss"],
     )
 
     loss_plot_path = None
     if run_config.plot_loss and (train_col or valid_col or test_col):
         plt.figure(figsize=(10, 4))
+
+        def plot_metric(column: str, label: str) -> None:
+            curve_cols = [column] + ([x_col] if x_col else [])
+            curve = metrics_df[curve_cols].dropna(subset=[column])
+            if curve.empty:
+                return
+            if x_col:
+                curve = curve.groupby(x_col, as_index=False)[column].last()
+                x_values = curve[x_col]
+            else:
+                x_values = np.arange(len(curve))
+            plt.plot(x_values, curve[column], label=label)
+
         if train_col is not None:
-            train_curve = metrics_df[[train_col] + ([step_col] if step_col else [])].dropna()
-            train_x = train_curve[step_col] if step_col else np.arange(len(train_curve))
-            plt.plot(train_x, train_curve[train_col], label="Train Loss")
+            plot_metric(train_col, "Train Loss")
         if valid_col is not None:
-            valid_curve = metrics_df[[valid_col] + ([step_col] if step_col else [])].dropna()
-            valid_x = valid_curve[step_col] if step_col else np.arange(len(valid_curve))
-            plt.plot(valid_x, valid_curve[valid_col], label="Valid Loss")
+            plot_metric(valid_col, "Valid Loss")
         if test_col is not None:
-            test_curve = metrics_df[[test_col] + ([step_col] if step_col else [])].dropna()
-            test_x = test_curve[step_col] if step_col else np.arange(len(test_curve))
-            plt.plot(test_x, test_curve[test_col], label="Test Loss")
+            plot_metric(test_col, "Test Loss")
         plt.title(f"Training Curve ({model_name})")
-        plt.xlabel("Step")
+        plt.xlabel(x_label)
         plt.ylabel("Loss")
         plt.grid(True)
         plt.legend()
