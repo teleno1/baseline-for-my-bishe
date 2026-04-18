@@ -50,8 +50,13 @@ class ExecutorOutput:
     val_phase: PhaseOutput
     test_phase: PhaseOutput
     best_model_path: Optional[str] = None
+    val_best_model_path: Optional[str] = None
+    test_best_model_path: Optional[str] = None
     metrics_path: Optional[str] = None
     loss_plot_path: Optional[str] = None
+    test_checkpoint_label: Optional[str] = None
+    compare_test_phase: Optional[PhaseOutput] = None
+    compare_test_checkpoint_label: Optional[str] = None
 
 
 @dataclass(frozen=True)

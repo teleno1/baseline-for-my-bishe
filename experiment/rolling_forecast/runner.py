@@ -68,7 +68,17 @@ class RollingForecastRunner:
             phase_name="test",
             target_df=split_data.test,
             phase_output=output.test_phase,
+            checkpoint_label=output.test_checkpoint_label,
         )
+        if output.compare_test_phase is not None:
+            finalize_phase(
+                context=context,
+                phase_name="test",
+                target_df=split_data.test,
+                phase_output=output.compare_test_phase,
+                checkpoint_label=output.compare_test_checkpoint_label,
+                artifact_suffix="_val_best",
+            )
 
         return ExperimentResult(
             model_name=model_spec.name,
@@ -82,6 +92,8 @@ class RollingForecastRunner:
             worst_origin=test_phase.worst_origin,
             artifact_dir=str(artifact_dir),
             best_model_path=output.best_model_path,
+            val_best_model_path=output.val_best_model_path,
+            test_best_model_path=output.test_best_model_path,
             metrics_path=output.metrics_path,
             loss_plot_path=output.loss_plot_path,
             forecast_plot_path=test_phase.forecast_plot_path,

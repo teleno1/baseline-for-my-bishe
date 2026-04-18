@@ -32,6 +32,7 @@ class RunConfig:
     ml_early_stopping_rounds: Optional[int] = 20
     neural_loss_name: str = "MAPE"
     neural_loss_params: dict[str, Any] = field(default_factory=dict)
+    neural_test_checkpoint_mode: str = "best"
     save_dir: str = "./artifacts"
     plot_forecast: bool = True
     plot_loss: bool = True
@@ -61,6 +62,8 @@ class RunConfig:
             )
         if not isinstance(self.neural_loss_params, dict):
             raise ValueError("neural_loss_params must be a dict")
+        if self.neural_test_checkpoint_mode not in {"best", "last"}:
+            raise ValueError("neural_test_checkpoint_mode must be 'best' or 'last'")
 
     def normalized_split_ratio(self) -> tuple[float, float, float]:
         total = float(sum(self.split_ratio))
@@ -98,6 +101,8 @@ class ExperimentResult:
     worst_origin: Optional[pd.Timestamp]
     artifact_dir: Optional[str]
     best_model_path: Optional[str]
+    val_best_model_path: Optional[str]
+    test_best_model_path: Optional[str]
     metrics_path: Optional[str]
     loss_plot_path: Optional[str]
     forecast_plot_path: Optional[str]
@@ -135,6 +140,8 @@ class ExperimentResult:
             worst_origin=None,
             artifact_dir=None,
             best_model_path=None,
+            val_best_model_path=None,
+            test_best_model_path=None,
             metrics_path=None,
             loss_plot_path=None,
             forecast_plot_path=None,
@@ -155,6 +162,8 @@ class ExperimentResult:
             "skip_reason": self.skip_reason,
             "artifact_dir": self.artifact_dir,
             "best_model_path": self.best_model_path,
+            "val_best_model_path": self.val_best_model_path,
+            "test_best_model_path": self.test_best_model_path,
             "rolling_raw_path": self.rolling_raw_path,
             "overlay_plot_path": self.overlay_plot_path,
         }

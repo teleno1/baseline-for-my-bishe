@@ -3,6 +3,8 @@ data/
 
 # 缓存
 experiment/__pycache__/
+experiment/rolling_forecast/__pycache__/
+experiment/rolling_forecast/executors/__pycache__/
 
 # 测试文件
 tests/

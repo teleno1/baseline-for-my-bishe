@@ -17,6 +17,8 @@ def finalize_phase(
     phase_name: str,
     target_df: pd.DataFrame,
     phase_output: PhaseOutput,
+    checkpoint_label: Optional[str] = None,
+    artifact_suffix: str = "",
 ) -> FinalizedPhase:
     """Summarize a rolling phase and build test artifacts."""
 
@@ -35,6 +37,7 @@ def finalize_phase(
         rolling_raw_path = save_rolling_raw_artifact(
             rolling_raw_df=rolling_raw_df,
             artifact_dir=context.artifact_dir,
+            artifact_suffix=artifact_suffix,
         )
 
     if origin_mape_df.empty:
@@ -56,6 +59,8 @@ def finalize_phase(
             context=context,
             target_df=target_df,
             rolling_raw_df=rolling_raw_df,
+            checkpoint_label=checkpoint_label,
+            artifact_suffix=artifact_suffix,
         )
         forecast_plot_path = plot_test_forecast(
             context=context,
@@ -64,6 +69,8 @@ def finalize_phase(
             overall_mape=overall_mape,
             best_origin=best_origin,
             worst_origin=worst_origin,
+            checkpoint_label=checkpoint_label,
+            artifact_suffix=artifact_suffix,
         )
 
     return FinalizedPhase(
@@ -134,10 +141,12 @@ def build_rolling_raw_df(
 def save_rolling_raw_artifact(
     rolling_raw_df: pd.DataFrame,
     artifact_dir: Path,
+    artifact_suffix: str = "",
 ) -> str:
     """Save the rolling test detail CSV for the current run."""
 
-    rolling_raw_path = artifact_dir / "rolling_test_raw.csv"
+    suffix = artifact_suffix or ""
+    rolling_raw_path = artifact_dir / f"rolling_test_raw{suffix}.csv"
     rolling_raw_df.to_csv(rolling_raw_path, index=False, encoding="utf-8-sig")
     return str(rolling_raw_path)
 
@@ -245,6 +254,8 @@ def plot_test_overlay(
     context: ExecutionContext,
     target_df: pd.DataFrame,
     rolling_raw_df: pd.DataFrame,
+    checkpoint_label: Optional[str] = None,
+    artifact_suffix: str = "",
 ) -> Optional[str]:
     """Plot non-overlapping rolling predictions over the full test interval."""
 
@@ -291,7 +302,10 @@ def plot_test_overlay(
             label=group_plot_label,
         )
 
-    ax.set_title(f"Rolling Test Prediction Overlay ({context.model_name})")
+    title = f"Rolling Test Prediction Overlay ({context.model_name})"
+    if checkpoint_label:
+        title = f"{title}\nfrom {checkpoint_label}"
+    ax.set_title(title)
     ax.set_xlabel("Date")
     ax.set_ylabel("Daily Electricity Load")
     ax.grid(True, alpha=0.25)
@@ -305,7 +319,8 @@ def plot_test_overlay(
 
     overlay_plot_path = None
     if context.run_config.save_plots:
-        overlay_plot_path = context.artifact_dir / "rolling_test_overlay.png"
+        suffix = artifact_suffix or ""
+        overlay_plot_path = context.artifact_dir / f"rolling_test_overlay{suffix}.png"
         fig.savefig(overlay_plot_path, dpi=150, bbox_inches="tight")
     plt.show()
     plt.close(fig)
@@ -319,6 +334,8 @@ def plot_test_forecast(
     overall_mape: float,
     best_origin: Optional[pd.Timestamp],
     worst_origin: Optional[pd.Timestamp],
+    checkpoint_label: Optional[str] = None,
+    artifact_suffix: str = "",
 ) -> Optional[str]:
     """Plot the best and worst rolling forecasts for the test phase."""
 
@@ -358,15 +375,16 @@ def plot_test_forecast(
             f"MAPE={worst_mape:.2f}%)"
         ),
     )
+    checkpoint_suffix = f", from {checkpoint_label}" if checkpoint_label else ""
     if context.model_spec.model_type == "neural":
         plt.title(
-            f"Rolling Test Forecast ({context.model_name})\n"
+            f"Rolling Test Forecast ({context.model_name}{checkpoint_suffix})\n"
             f"Loss Function:{context.run_config.neural_loss_name},"
             f"Horizon={context.run_config.horizon}, Mean Origin MAPE={overall_mape:.2f}%"
         )
     else:
         plt.title(
-            f"Rolling Test Forecast ({context.model_name})\n"
+            f"Rolling Test Forecast ({context.model_name}{checkpoint_suffix})\n"
             f"Horizon={context.run_config.horizon}, Mean Origin MAPE={overall_mape:.2f}%"
         )
     plt.xlabel("Date")
@@ -377,7 +395,8 @@ def plot_test_forecast(
 
     forecast_plot_path = None
     if context.run_config.save_plots:
-        forecast_plot_path = context.artifact_dir / "forecast_plot.png"
+        suffix = artifact_suffix or ""
+        forecast_plot_path = context.artifact_dir / f"forecast_plot{suffix}.png"
         plt.savefig(forecast_plot_path, dpi=150, bbox_inches="tight")
     plt.show()
     plt.close()
@@ -414,9 +433,13 @@ def build_loss_artifact(
         metrics_df,
         ["valid_loss", "ptl/val_loss", "val_loss"],
     )
+    test_col = choose_metric_column(
+        metrics_df,
+        ["ptl/test_loss", "test_loss"],
+    )
 
     loss_plot_path = None
-    if run_config.plot_loss and (train_col or valid_col):
+    if run_config.plot_loss and (train_col or valid_col or test_col):
         plt.figure(figsize=(10, 4))
         if train_col is not None:
             train_curve = metrics_df[[train_col] + ([step_col] if step_col else [])].dropna()
@@ -426,6 +449,10 @@ def build_loss_artifact(
             valid_curve = metrics_df[[valid_col] + ([step_col] if step_col else [])].dropna()
             valid_x = valid_curve[step_col] if step_col else np.arange(len(valid_curve))
             plt.plot(valid_x, valid_curve[valid_col], label="Valid Loss")
+        if test_col is not None:
+            test_curve = metrics_df[[test_col] + ([step_col] if step_col else [])].dropna()
+            test_x = test_curve[step_col] if step_col else np.arange(len(test_curve))
+            plt.plot(test_x, test_curve[test_col], label="Test Loss")
         plt.title(f"Training Curve ({model_name})")
         plt.xlabel("Step")
         plt.ylabel("Loss")
