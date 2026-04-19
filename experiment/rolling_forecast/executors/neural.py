@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import math
 import os
 from pathlib import Path
@@ -13,7 +14,7 @@ from pytorch_lightning.callbacks import Callback, EarlyStopping, ModelCheckpoint
 
 from ...config import RunConfig
 from ..artifacts import build_loss_artifact
-from ..metrics import safe_mape
+from ..metrics import TargetScaler, safe_mape
 from ..types import ExecutionContext, ExecutorOutput, PhaseOutput
 from .base import BaseExecutor
 
@@ -100,6 +101,7 @@ def evaluate_phase_with_forecaster(
     base_history_df: pd.DataFrame,
     target_df: pd.DataFrame,
     origins: list[int],
+    target_scaler: TargetScaler | None = None,
 ) -> PhaseOutput:
     if not origins:
         return PhaseOutput(
@@ -120,12 +122,18 @@ def evaluate_phase_with_forecaster(
         history_df = history.iloc[-context.run_config.input_size :].copy()
         synthetic_id = f"{base_id}__origin_{origin_id}"
         history_df["unique_id"] = synthetic_id
+        y_insample = history_df["y"].to_numpy(dtype=float)
+        history_for_prediction = history_df.copy()
+        if target_scaler is not None:
+            history_for_prediction["y"] = target_scaler.transform_values(
+                history_for_prediction["y"].to_numpy(dtype=float)
+            )
 
         future_df = target_df.iloc[
             origin_offset : origin_offset + context.run_config.horizon
         ][context.future_cols].copy()
         future_df["unique_id"] = synthetic_id
-        history_parts.append(history_df)
+        history_parts.append(history_for_prediction)
         future_parts.append(future_df)
 
         y_true = target_df.iloc[
@@ -142,7 +150,7 @@ def evaluate_phase_with_forecaster(
                 "synthetic_id": synthetic_id,
                 "origin": origin,
                 "y_true": y_true,
-                "y_insample": history_df["y"].to_numpy(dtype=float),
+                "y_insample": y_insample,
                 "ds": ds_forecast,
                 "cutoff": pd.to_datetime(history.iloc[-1]["ds"]),
             }
@@ -169,6 +177,8 @@ def evaluate_phase_with_forecaster(
         if pred_group is None:
             raise ValueError(f"Missing predictions for {record['synthetic_id']}")
         y_pred = pred_group[prediction_column].to_numpy(dtype=float)
+        if target_scaler is not None:
+            y_pred = target_scaler.inverse_values(y_pred)
         if len(y_pred) != len(record["y_true"]):
             raise ValueError(
                 f"Prediction length mismatch for {record['synthetic_id']}: "
@@ -225,19 +235,17 @@ def compute_phase_loss(run_config: RunConfig, phase_output: PhaseOutput) -> floa
     return float(loss_value.detach().cpu().item())
 
 
-def compute_normalized_phase_loss(
+def compute_train_normalized_phase_loss(
     run_config: RunConfig,
     phase_output: PhaseOutput,
-    scaler_type: str,
+    target_scaler: TargetScaler,
 ) -> float:
     import torch
-    from neuralforecast.common._scalers import TemporalNorm
 
     if not phase_output.diagnostics:
         return float("nan")
 
     loss_fn = build_neural_loss(run_config)
-    scaler = TemporalNorm(scaler_type=scaler_type, dim=1, num_features=1)
     ordered_origins = sorted(phase_output.diagnostics)
     y_true = np.stack(
         [
@@ -251,27 +259,27 @@ def compute_normalized_phase_loss(
             for origin in ordered_origins
         ]
     )
-    y_insample = np.stack(
-        [
-            np.asarray(phase_output.diagnostics[origin]["y_insample"], dtype=float)
-            for origin in ordered_origins
-        ]
-    )
 
-    temporal = np.concatenate([y_insample, y_true], axis=1)
-    temporal_tensor = torch.tensor(temporal, dtype=torch.float32).unsqueeze(-1)
-    mask = torch.ones_like(temporal_tensor)
-    mask[:, -run_config.horizon :, :] = 0.0
-    normalized = scaler.transform(x=temporal_tensor, mask=mask)
-    normalized_y_true = normalized[:, -run_config.horizon :, :]
-
-    shift = scaler.x_shift
-    scale = scaler.x_scale
-    y_hat_tensor = torch.tensor(y_pred, dtype=torch.float32).unsqueeze(-1)
-    normalized_y_pred = scaler.scaler(y_hat_tensor, shift, scale)
+    normalized_y_true = torch.tensor(
+        target_scaler.transform_values(y_true),
+        dtype=torch.float32,
+    ).unsqueeze(-1)
+    normalized_y_pred = torch.tensor(
+        target_scaler.transform_values(y_pred),
+        dtype=torch.float32,
+    ).unsqueeze(-1)
 
     if run_config.neural_loss_name == "MASE":
-        normalized_y_insample = normalized[:, : y_insample.shape[1], 0]
+        y_insample = np.stack(
+            [
+                np.asarray(phase_output.diagnostics[origin]["y_insample"], dtype=float)
+                for origin in ordered_origins
+            ]
+        )
+        normalized_y_insample = torch.tensor(
+            target_scaler.transform_values(y_insample),
+            dtype=torch.float32,
+        )
         loss_value = loss_fn(
             y=normalized_y_true,
             y_hat=normalized_y_pred,
@@ -283,6 +291,24 @@ def compute_normalized_phase_loss(
     return float(loss_value.detach().cpu().item())
 
 
+def compute_normalized_phase_loss(
+    run_config: RunConfig,
+    phase_output: PhaseOutput,
+    scaler_type: str | None = None,
+    target_scaler: TargetScaler | None = None,
+) -> float:
+    if target_scaler is None:
+        raise ValueError(
+            "target_scaler is required; NeuralForecast window scaler_type is not used "
+            "for rolling phase loss."
+        )
+    return compute_train_normalized_phase_loss(
+        run_config=run_config,
+        phase_output=phase_output,
+        target_scaler=target_scaler,
+    )
+
+
 class RollingPhaseLossLogger(Callback):
     def __init__(
         self,
@@ -291,14 +317,16 @@ class RollingPhaseLossLogger(Callback):
         model_cls: type,
         model_name: str,
         checkpoint_dir: Path,
+        target_scaler: TargetScaler,
     ) -> None:
         super().__init__()
         self.context = context
         self.model_cls = model_cls
         self.model_name = model_name
+        self.target_scaler = target_scaler
         self.registry_key = str(checkpoint_dir.resolve())
-        self.val_metric_name = "ptl/val_loss_norm"
-        self.test_metric_name = "ptl/test_loss_norm"
+        self.val_metric_name = "ptl/val_loss_train_norm"
+        self.test_metric_name = "ptl/test_loss_train_norm"
         self.temp_checkpoint_path = checkpoint_dir / "_current_phase_loss.ckpt"
 
     def on_validation_epoch_end(self, trainer: Any, pl_module: Any) -> None:
@@ -320,7 +348,6 @@ class RollingPhaseLossLogger(Callback):
                 source_forecaster,
                 monitor_model,
             )
-            scaler_type = getattr(getattr(monitor_model, "scaler", None), "scaler_type", "identity")
             val_phase_output = evaluate_phase_with_forecaster(
                 context=self.context,
                 model_name=self.model_name,
@@ -328,6 +355,7 @@ class RollingPhaseLossLogger(Callback):
                 base_history_df=self.context.split_data.train,
                 target_df=self.context.split_data.val,
                 origins=self.context.split_data.val_origins,
+                target_scaler=self.target_scaler,
             )
             test_phase_output = evaluate_phase_with_forecaster(
                 context=self.context,
@@ -336,16 +364,17 @@ class RollingPhaseLossLogger(Callback):
                 base_history_df=self.context.split_data.trainval,
                 target_df=self.context.split_data.test,
                 origins=self.context.split_data.test_origins,
+                target_scaler=self.target_scaler,
             )
-            val_loss = compute_normalized_phase_loss(
+            val_loss = compute_train_normalized_phase_loss(
                 self.context.run_config,
                 val_phase_output,
-                scaler_type=scaler_type,
+                target_scaler=self.target_scaler,
             )
-            test_loss = compute_normalized_phase_loss(
+            test_loss = compute_train_normalized_phase_loss(
                 self.context.run_config,
                 test_phase_output,
-                scaler_type=scaler_type,
+                target_scaler=self.target_scaler,
             )
             val_metric = torch.tensor(val_loss, dtype=torch.float32, device=pl_module.device)
             test_metric = torch.tensor(test_loss, dtype=torch.float32, device=pl_module.device)
@@ -374,19 +403,21 @@ def build_rolling_phase_loss_logger(
     model_cls: type,
     model_name: str,
     checkpoint_dir: Path,
+    target_scaler: TargetScaler,
 ) -> Any:
     return RollingPhaseLossLogger(
         context=context,
         model_cls=model_cls,
         model_name=model_name,
         checkpoint_dir=checkpoint_dir,
+        target_scaler=target_scaler,
     )
 
 
 class NeuralExecutor(BaseExecutor):
     def _normalize_neural_params(self) -> dict[str, Any]:
         neural_params = dict(self.context.model_spec.model_params)
-        neural_params.setdefault("scaler_type", "standard")
+        neural_params["scaler_type"] = "identity"
 
         if self.context.model_spec.model_cls.__name__ != "TimeLLM":
             return neural_params
@@ -401,6 +432,24 @@ class NeuralExecutor(BaseExecutor):
         neural_params.setdefault("enc_in", 1)
         neural_params.setdefault("dec_in", 1)
         return neural_params
+
+    def _build_target_scaler(self) -> TargetScaler:
+        return TargetScaler.fit(
+            self.context.split_data.train["y"].to_numpy(dtype=float),
+        )
+
+    def _scale_target_df(self, df: pd.DataFrame, target_scaler: TargetScaler) -> pd.DataFrame:
+        scaled_df = df.copy()
+        scaled_df["y"] = target_scaler.transform_values(scaled_df["y"].to_numpy(dtype=float))
+        return scaled_df
+
+    def _save_target_scaler_artifact(self, target_scaler: TargetScaler) -> str:
+        scaler_path = self.context.artifact_dir / "target_scaler.json"
+        scaler_path.write_text(
+            json.dumps(target_scaler.to_dict(), indent=2),
+            encoding="utf-8",
+        )
+        return str(scaler_path)
 
     def _coerce_positive_int(self, value: Any, param_name: str) -> int:
         if isinstance(value, bool):
@@ -458,6 +507,9 @@ class NeuralExecutor(BaseExecutor):
 
         checkpoint_dir = self.context.artifact_dir / "checkpoints"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        target_scaler = self._build_target_scaler()
+        self._save_target_scaler_artifact(target_scaler)
+        scaled_trainval = self._scale_target_df(self.context.split_data.trainval, target_scaler)
 
         csv_logger = CSVLogger(
             save_dir=str(self.context.artifact_dir),
@@ -467,7 +519,7 @@ class NeuralExecutor(BaseExecutor):
         val_checkpoint_callback = ModelCheckpoint(
             dirpath=str(checkpoint_dir),
             filename="val_best",
-            monitor="ptl/val_loss_norm",
+            monitor="ptl/val_loss_train_norm",
             mode="min",
             save_top_k=1,
             save_last=True,
@@ -478,6 +530,7 @@ class NeuralExecutor(BaseExecutor):
             model_cls=self.context.model_spec.model_cls,
             model_name=self.model_name,
             checkpoint_dir=checkpoint_dir,
+            target_scaler=target_scaler,
         )
 
         neural_params = self._normalize_neural_params()
@@ -491,7 +544,7 @@ class NeuralExecutor(BaseExecutor):
         if self.context.run_config.early_stop_patience_epochs > 0:
             trainer_callbacks.append(
                 EarlyStopping(
-                    monitor="ptl/val_loss_norm",
+                    monitor="ptl/val_loss_train_norm",
                     patience=self.context.run_config.early_stop_patience_epochs,
                     mode="min",
                 )
@@ -518,7 +571,7 @@ class NeuralExecutor(BaseExecutor):
         registry_key = str(checkpoint_dir.resolve())
         FORECASTER_REGISTRY[registry_key] = nf
         try:
-            nf.fit(df=self.context.split_data.trainval, val_size=self.context.split_data.n_val)
+            nf.fit(df=scaled_trainval, val_size=self.context.split_data.n_val)
         finally:
             FORECASTER_REGISTRY.pop(registry_key, None)
 
@@ -568,6 +621,7 @@ class NeuralExecutor(BaseExecutor):
             base_history_df=self.context.split_data.train,
             target_df=self.context.split_data.val,
             origins=self.context.split_data.val_origins,
+            target_scaler=target_scaler,
         )
 
         compare_test_phase = None
@@ -583,6 +637,7 @@ class NeuralExecutor(BaseExecutor):
             base_history_df=self.context.split_data.trainval,
             target_df=self.context.split_data.test,
             origins=self.context.split_data.test_origins,
+            target_scaler=target_scaler,
         )
 
         return ExecutorOutput(
@@ -662,6 +717,7 @@ class NeuralExecutor(BaseExecutor):
         base_history_df: pd.DataFrame,
         target_df: pd.DataFrame,
         origins: list[int],
+        target_scaler: TargetScaler | None = None,
     ) -> PhaseOutput:
         return evaluate_phase_with_forecaster(
             context=self.context,
@@ -670,4 +726,5 @@ class NeuralExecutor(BaseExecutor):
             base_history_df=base_history_df,
             target_df=target_df,
             origins=origins,
+            target_scaler=target_scaler,
         )

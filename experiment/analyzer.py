@@ -6,6 +6,8 @@ from os import PathLike
 import numpy as np
 import pandas as pd
 
+from .rolling_forecast.metrics import ForecastMetricCalculator
+
 
 class RollingTestAnalyzer:
     """分析 rolling_test_raw.csv 的滚动测试结果。
@@ -71,10 +73,13 @@ class RollingTestAnalyzer:
             target_col=target_col,
         )
         self.train_actuals = self._build_train_actuals()
-        self.normalization_mean = float(np.mean(self.train_actuals))
-        self.normalization_std = float(np.std(self.train_actuals))
-        if self.normalization_std <= self.eps:
-            raise ValueError("training target standard deviation is zero or too close to zero")
+        self.metric_calculator = ForecastMetricCalculator.from_train_actuals(
+            self.train_actuals,
+            eps=self.eps,
+        )
+        self.target_scaler = self.metric_calculator.target_scaler
+        self.normalization_mean = self.target_scaler.mean
+        self.normalization_std = self.target_scaler.std
 
         self.origin_ids = pd.Index(self.rolling_raw["origin_id"].unique(), name="origin_id")
         self.horizons = pd.Index(
@@ -96,7 +101,7 @@ class RollingTestAnalyzer:
         self.error = self.rolling_raw["error"].to_numpy(dtype=float).reshape(n_origins, n_horizons)
         self.y_true = self.rolling_raw["y_true"].to_numpy(dtype=float).reshape(n_origins, n_horizons)
         self.y_pred = self.rolling_raw["y_pred"].to_numpy(dtype=float).reshape(n_origins, n_horizons)
-        self.normalized_error = self.error / self.normalization_std
+        self.normalized_error = self.metric_calculator.normalized_error(self.y_true, self.y_pred)
 
     def overall_metrics(self) -> pd.Series:
         """返回整体误差指标。
@@ -112,22 +117,11 @@ class RollingTestAnalyzer:
         WAPE/MAPE 继续使用原始尺度计算比例。
         """
 
-        metrics = pd.Series(
-            {
-                "MAE": float(np.mean(self._absolute_normalized_error())),
-                "RMSE": float(np.sqrt(np.mean(np.square(self.normalized_error)))),
-                "WAPE(%)": float(
-                    np.sum(self._absolute_error())
-                    / max(float(np.sum(np.abs(self.y_true))), self.eps)
-                    * 100
-                ),
-                "Bias": float(np.mean(self.normalized_error)),
-                "MAPE(%)": float(np.mean(self._absolute_percentage_error()) * 100),
-            },
-            dtype=float,
-            name="overall",
+        return self.metric_calculator.overall_metrics(
+            self.y_true,
+            self.y_pred,
+            columns=self.OVERALL_METRIC_COLUMNS,
         )
-        return metrics.loc[list(self.OVERALL_METRIC_COLUMNS)]
 
     def loss_matrix(self, scope: str) -> pd.DataFrame:
         """返回指定粒度下的误差矩阵。
@@ -188,16 +182,12 @@ class RollingTestAnalyzer:
         MAE/RMSE/Bias 使用训练集标准差归一化后的误差。
         """
 
-        losses = pd.DataFrame(
-            {
-                "MAE": np.mean(self._absolute_normalized_error(), axis=0),
-                "RMSE": np.sqrt(np.mean(np.square(self.normalized_error), axis=0)),
-                "Bias": np.mean(self.normalized_error, axis=0),
-            },
-            index=self.horizons,
-            dtype=float,
+        return self.metric_calculator.horizon_loss_matrix(
+            self.y_true,
+            self.y_pred,
+            horizons=self.horizons,
+            columns=self.HORIZON_METRIC_COLUMNS,
         )
-        return losses.loc[:, list(self.HORIZON_METRIC_COLUMNS)]
 
     def _window_loss_matrix(self) -> pd.DataFrame:
         """计算 window-wise 指标表。
@@ -206,16 +196,12 @@ class RollingTestAnalyzer:
         MAE/RMSE 使用训练集标准差归一化后的误差，MAPE 使用原始比例。
         """
 
-        losses = pd.DataFrame(
-            {
-                "MAE": np.mean(self._absolute_normalized_error(), axis=1),
-                "RMSE": np.sqrt(np.mean(np.square(self.normalized_error), axis=1)),
-                "MAPE(%)": np.mean(self._absolute_percentage_error(), axis=1) * 100,
-            },
-            index=self.origin_dates,
-            dtype=float,
+        return self.metric_calculator.window_loss_matrix(
+            self.y_true,
+            self.y_pred,
+            origin_dates=self.origin_dates,
+            columns=self.WINDOW_METRIC_COLUMNS,
         )
-        return losses.loc[:, list(self.WINDOW_METRIC_COLUMNS)]
 
     def _window_win_rate(self, baseline: "RollingTestAnalyzer") -> pd.Series:
         """计算当前模型相对 baseline 的 window-wise 胜率。"""
@@ -248,7 +234,7 @@ class RollingTestAnalyzer:
 
     def _absolute_percentage_error(self) -> np.ndarray:
         """返回逐点绝对百分比误差矩阵 |E| / max(|Y|, eps)。"""
-        return self._absolute_error() / np.maximum(np.abs(self.y_true), self.eps)
+        return self.metric_calculator.absolute_percentage_error(self.y_true, self.y_pred)
 
     def _worst_ten_percent_mean(self, values: pd.Series) -> float:
         """计算最差 10% 样本的平均值。

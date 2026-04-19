@@ -434,11 +434,11 @@ def build_loss_artifact(
     )
     valid_col = choose_metric_column(
         metrics_df,
-        ["ptl/val_loss_norm", "ptl/val_loss", "valid_loss", "val_loss"],
+        ["ptl/val_loss_train_norm"],
     )
     test_col = choose_metric_column(
         metrics_df,
-        ["ptl/test_loss_norm", "ptl/test_loss", "test_loss"],
+        ["ptl/test_loss_train_norm"],
     )
 
     loss_plot_path = None
