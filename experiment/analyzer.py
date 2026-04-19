@@ -1,6 +1,5 @@
 ﻿from __future__ import annotations
 
-from collections.abc import Sequence
 from math import ceil
 from os import PathLike
 
@@ -17,7 +16,8 @@ class RollingTestAnalyzer:
     核心思路：
     1. 先把表按 origin_id / horizon 排序。
     2. 再把 error、y_true、y_pred reshape 成 O x H 矩阵。
-    3. 基于矩阵分别计算 overall、horizon-wise、window-wise 指标。
+    3. 基于训练集标准差归一化后的误差矩阵，计算非比例类指标。
+       比例类指标仍使用原始误差与原始真实值。
     """
 
     REQUIRED_COLUMNS = (
@@ -29,7 +29,7 @@ class RollingTestAnalyzer:
         "y_pred",
         "error",
     )
-    OVERALL_METRIC_COLUMNS = ("MASE", "RMSE", "WAPE(%)", "Bias", "MAPE(%)")
+    OVERALL_METRIC_COLUMNS = ("MAE", "RMSE", "WAPE(%)", "Bias", "MAPE(%)")
     HORIZON_METRIC_COLUMNS = ("MAE", "RMSE", "Bias")
     WINDOW_METRIC_COLUMNS = ("MAE", "RMSE", "MAPE(%)")
     WINDOW_SUMMARY_COLUMNS = ("mean", "median", "std", "worst10%", "max")
@@ -37,8 +37,10 @@ class RollingTestAnalyzer:
     def __init__(
         self,
         rolling_raw: str | PathLike[str] | pd.DataFrame,
-        history_actuals: Sequence[float] | np.ndarray | pd.Series,
-        seasonality: int,
+        full_raw: str | PathLike[str] | pd.DataFrame,
+        split_ratio: tuple[float, float, float] = (7, 1, 2),
+        date_col: str = "date",
+        target_col: str = "OT",
         eps: float = 1e-8,
     ) -> None:
         """初始化分析器并完成输入校验与矩阵重建。
@@ -47,20 +49,32 @@ class RollingTestAnalyzer:
         ----------
         rolling_raw
             rolling_test_raw.csv 的路径，或同结构的 DataFrame。
-        history_actuals
-            首个测试目标点之前的真实历史序列，按时间升序排列。
-            这里只用于计算 overall MASE 的全局缩放分母。
-        seasonality
-            MASE 使用的季节周期，例如日频周季节性通常取 7。
+        full_raw
+            完整原始目标序列的路径，或同结构的 DataFrame。分析器会按
+            date_col 排序，并用 split_ratio 对应的训练段计算归一化尺度。
+        split_ratio
+            训练/验证/测试比例，需与实验运行时保持一致。
+        date_col
+            full_raw 中的日期列名。
+        target_col
+            full_raw 中的目标列名。
         eps
             百分比类指标的分母保护常数，避免 y_true 接近 0 时数值爆炸。
         """
 
         self.eps = self._validate_eps(eps)
-        self.seasonality = self._validate_seasonality(seasonality)
+        self.split_ratio = self._validate_split_ratio(split_ratio)
         self.rolling_raw = self._load_rolling_raw(rolling_raw)
-        self.history_actuals = self._load_history_actuals(history_actuals)
-        self.mase_scale = self._build_mase_scale()
+        self.full_raw = self._load_full_raw(
+            full_raw=full_raw,
+            date_col=date_col,
+            target_col=target_col,
+        )
+        self.train_actuals = self._build_train_actuals()
+        self.normalization_mean = float(np.mean(self.train_actuals))
+        self.normalization_std = float(np.std(self.train_actuals))
+        if self.normalization_std <= self.eps:
+            raise ValueError("training target standard deviation is zero or too close to zero")
 
         self.origin_ids = pd.Index(self.rolling_raw["origin_id"].unique(), name="origin_id")
         self.horizons = pd.Index(
@@ -82,28 +96,32 @@ class RollingTestAnalyzer:
         self.error = self.rolling_raw["error"].to_numpy(dtype=float).reshape(n_origins, n_horizons)
         self.y_true = self.rolling_raw["y_true"].to_numpy(dtype=float).reshape(n_origins, n_horizons)
         self.y_pred = self.rolling_raw["y_pred"].to_numpy(dtype=float).reshape(n_origins, n_horizons)
+        self.normalized_error = self.error / self.normalization_std
 
     def overall_metrics(self) -> pd.Series:
         """返回整体误差指标。
 
         overall 保留 5 个指标：
-        - MASE
+        - MAE
         - RMSE
         - WAPE(%)
         - Bias
         - MAPE(%)
+
+        其中 MAE/RMSE/Bias 使用训练集标准差归一化后的误差；
+        WAPE/MAPE 继续使用原始尺度计算比例。
         """
 
         metrics = pd.Series(
             {
-                "MASE": float(np.mean(self._absolute_error()) / self.mase_scale),
-                "RMSE": float(np.sqrt(np.mean(np.square(self.error)))),
+                "MAE": float(np.mean(self._absolute_normalized_error())),
+                "RMSE": float(np.sqrt(np.mean(np.square(self.normalized_error)))),
                 "WAPE(%)": float(
                     np.sum(self._absolute_error())
                     / max(float(np.sum(np.abs(self.y_true))), self.eps)
                     * 100
                 ),
-                "Bias": float(np.mean(self.error)),
+                "Bias": float(np.mean(self.normalized_error)),
                 "MAPE(%)": float(np.mean(self._absolute_percentage_error()) * 100),
             },
             dtype=float,
@@ -167,13 +185,14 @@ class RollingTestAnalyzer:
         """计算 horizon-wise 指标表。
 
         每一列固定一个 horizon，聚合所有 origin 上该 horizon 的误差。
+        MAE/RMSE/Bias 使用训练集标准差归一化后的误差。
         """
 
         losses = pd.DataFrame(
             {
-                "MAE": np.mean(self._absolute_error(), axis=0),
-                "RMSE": np.sqrt(np.mean(np.square(self.error), axis=0)),
-                "Bias": np.mean(self.error, axis=0),
+                "MAE": np.mean(self._absolute_normalized_error(), axis=0),
+                "RMSE": np.sqrt(np.mean(np.square(self.normalized_error), axis=0)),
+                "Bias": np.mean(self.normalized_error, axis=0),
             },
             index=self.horizons,
             dtype=float,
@@ -184,12 +203,13 @@ class RollingTestAnalyzer:
         """计算 window-wise 指标表。
 
         每一行对应一个 origin 窗口，先在该窗口内部对 H 个 horizon 聚合。
+        MAE/RMSE 使用训练集标准差归一化后的误差，MAPE 使用原始比例。
         """
 
         losses = pd.DataFrame(
             {
-                "MAE": np.mean(self._absolute_error(), axis=1),
-                "RMSE": np.sqrt(np.mean(np.square(self.error), axis=1)),
+                "MAE": np.mean(self._absolute_normalized_error(), axis=1),
+                "RMSE": np.sqrt(np.mean(np.square(self.normalized_error), axis=1)),
                 "MAPE(%)": np.mean(self._absolute_percentage_error(), axis=1) * 100,
             },
             index=self.origin_dates,
@@ -222,6 +242,10 @@ class RollingTestAnalyzer:
         """返回逐点绝对误差矩阵 |E|。"""
         return np.abs(self.error)
 
+    def _absolute_normalized_error(self) -> np.ndarray:
+        """返回逐点归一化绝对误差矩阵 |E / train_std|。"""
+        return np.abs(self.normalized_error)
+
     def _absolute_percentage_error(self) -> np.ndarray:
         """返回逐点绝对百分比误差矩阵 |E| / max(|Y|, eps)。"""
         return self._absolute_error() / np.maximum(np.abs(self.y_true), self.eps)
@@ -235,33 +259,6 @@ class RollingTestAnalyzer:
 
         worst_count = max(1, ceil(len(values) * 0.1))
         return float(values.nlargest(worst_count).mean())
-
-    def _build_mase_scale(self) -> float:
-        """基于历史真实值构造 overall MASE 的全局缩放分母。"""
-
-        if len(self.history_actuals) <= self.seasonality:
-            raise ValueError("history_actuals must be longer than seasonality to compute MASE")
-
-        diffs = np.abs(self.history_actuals[self.seasonality :] - self.history_actuals[: -self.seasonality])
-        scale = float(np.mean(diffs))
-        if scale <= self.eps:
-            raise ValueError("MASE scale is zero or too close to zero")
-        return scale
-
-    def _load_history_actuals(
-        self,
-        history_actuals: Sequence[float] | np.ndarray | pd.Series,
-    ) -> np.ndarray:
-        """读取并校验 history_actuals。"""
-
-        values = np.asarray(history_actuals, dtype=float)
-        if values.ndim != 1:
-            raise ValueError("history_actuals must be a one-dimensional sequence")
-        if values.size == 0:
-            raise ValueError("history_actuals must not be empty")
-        if np.isnan(values).any():
-            raise ValueError("history_actuals contains missing values")
-        return values
 
     def _load_rolling_raw(self, rolling_raw: str | PathLike[str] | pd.DataFrame) -> pd.DataFrame:
         """读取 rolling 原始表，并完成类型归一化与结构校验。"""
@@ -288,6 +285,48 @@ class RollingTestAnalyzer:
         self._validate_rolling_shape(normalized)
         self._validate_error_column(normalized)
         return normalized
+
+    def _load_full_raw(
+        self,
+        full_raw: str | PathLike[str] | pd.DataFrame,
+        date_col: str,
+        target_col: str,
+    ) -> pd.DataFrame:
+        """读取完整原始序列，并保留日期与目标列用于训练集归一化。"""
+
+        if isinstance(full_raw, pd.DataFrame):
+            df = full_raw.copy()
+        else:
+            df = pd.read_csv(full_raw)
+
+        missing_columns = [column for column in (date_col, target_col) if column not in df.columns]
+        if missing_columns:
+            raise ValueError(f"full_raw is missing required columns: {missing_columns}")
+
+        normalized = df.loc[:, [date_col, target_col]].copy()
+        normalized[date_col] = self._coerce_date_column(normalized[date_col], date_col)
+        normalized[target_col] = self._coerce_float_column(normalized[target_col], target_col)
+        normalized = normalized.sort_values(date_col).reset_index(drop=True)
+        normalized = normalized.rename(columns={date_col: "date", target_col: "y"})
+
+        if normalized.empty:
+            raise ValueError("full_raw must not be empty")
+        return normalized
+
+    def _build_train_actuals(self) -> np.ndarray:
+        """按实验 split_ratio 从完整序列中截取训练段真实值。"""
+
+        train_ratio = self.split_ratio[0] / sum(self.split_ratio)
+        n_train = int(len(self.full_raw) * train_ratio)
+        if n_train <= 0:
+            raise ValueError("split_ratio produced an empty training subset")
+
+        train_actuals = self.full_raw["y"].iloc[:n_train].to_numpy(dtype=float)
+        if train_actuals.size == 0:
+            raise ValueError("training target subset must not be empty")
+        if np.isnan(train_actuals).any():
+            raise ValueError("training target subset contains missing values")
+        return train_actuals
 
     def _validate_rolling_shape(self, rolling_raw: pd.DataFrame) -> None:
         """校验 rolling 原始表能否稳定重建成完整的 O x H 矩阵。"""
@@ -368,11 +407,14 @@ class RollingTestAnalyzer:
             raise ValueError("eps must be positive")
         return eps_value
 
-    def _validate_seasonality(self, seasonality: int) -> int:
-        """校验 seasonality 为正整数。"""
+    def _validate_split_ratio(self, split_ratio: tuple[float, float, float]) -> tuple[float, float, float]:
+        """校验 split_ratio 为三个正数。"""
 
-        seasonality_value = float(seasonality)
-        if not seasonality_value.is_integer() or seasonality_value <= 0:
-            raise ValueError("seasonality must be a positive integer")
-        return int(seasonality_value)
+        if len(split_ratio) != 3:
+            raise ValueError("split_ratio must contain exactly three values")
+
+        normalized_ratio = tuple(float(value) for value in split_ratio)
+        if any(value <= 0 for value in normalized_ratio):
+            raise ValueError("split_ratio values must be positive")
+        return normalized_ratio
 

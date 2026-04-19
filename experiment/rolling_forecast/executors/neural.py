@@ -386,6 +386,7 @@ def build_rolling_phase_loss_logger(
 class NeuralExecutor(BaseExecutor):
     def _normalize_neural_params(self) -> dict[str, Any]:
         neural_params = dict(self.context.model_spec.model_params)
+        neural_params.setdefault("scaler_type", "standard")
 
         if self.context.model_spec.model_cls.__name__ != "TimeLLM":
             return neural_params
