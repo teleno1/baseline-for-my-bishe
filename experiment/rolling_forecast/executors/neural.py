@@ -14,7 +14,7 @@ from pytorch_lightning.callbacks import Callback, EarlyStopping, ModelCheckpoint
 
 from ...config import RunConfig
 from ..artifacts import build_loss_artifact
-from ..metrics import TargetScaler, safe_mape
+from ..metrics import ExogScaler, TargetScaler, safe_mape
 from ..types import ExecutionContext, ExecutorOutput, PhaseOutput
 from .base import BaseExecutor
 
@@ -102,6 +102,7 @@ def evaluate_phase_with_forecaster(
     target_df: pd.DataFrame,
     origins: list[int],
     target_scaler: TargetScaler | None = None,
+    exog_scaler: ExogScaler | None = None,
 ) -> PhaseOutput:
     if not origins:
         return PhaseOutput(
@@ -128,11 +129,15 @@ def evaluate_phase_with_forecaster(
             history_for_prediction["y"] = target_scaler.transform_values(
                 history_for_prediction["y"].to_numpy(dtype=float)
             )
+        if exog_scaler is not None:
+            history_for_prediction = exog_scaler.transform_frame(history_for_prediction)
 
         future_df = target_df.iloc[
             origin_offset : origin_offset + context.run_config.horizon
         ][context.future_cols].copy()
         future_df["unique_id"] = synthetic_id
+        if exog_scaler is not None:
+            future_df = exog_scaler.transform_frame(future_df)
         history_parts.append(history_for_prediction)
         future_parts.append(future_df)
 
@@ -318,12 +323,14 @@ class RollingPhaseLossLogger(Callback):
         model_name: str,
         checkpoint_dir: Path,
         target_scaler: TargetScaler,
+        exog_scaler: ExogScaler | None = None,
     ) -> None:
         super().__init__()
         self.context = context
         self.model_cls = model_cls
         self.model_name = model_name
         self.target_scaler = target_scaler
+        self.exog_scaler = exog_scaler
         self.registry_key = str(checkpoint_dir.resolve())
         self.val_metric_name = "ptl/val_loss_train_norm"
         self.test_metric_name = "ptl/test_loss_train_norm"
@@ -356,6 +363,7 @@ class RollingPhaseLossLogger(Callback):
                 target_df=self.context.split_data.val,
                 origins=self.context.split_data.val_origins,
                 target_scaler=self.target_scaler,
+                exog_scaler=self.exog_scaler,
             )
             test_phase_output = evaluate_phase_with_forecaster(
                 context=self.context,
@@ -365,6 +373,7 @@ class RollingPhaseLossLogger(Callback):
                 target_df=self.context.split_data.test,
                 origins=self.context.split_data.test_origins,
                 target_scaler=self.target_scaler,
+                exog_scaler=self.exog_scaler,
             )
             val_loss = compute_train_normalized_phase_loss(
                 self.context.run_config,
@@ -404,6 +413,7 @@ def build_rolling_phase_loss_logger(
     model_name: str,
     checkpoint_dir: Path,
     target_scaler: TargetScaler,
+    exog_scaler: ExogScaler | None = None,
 ) -> Any:
     return RollingPhaseLossLogger(
         context=context,
@@ -411,6 +421,7 @@ def build_rolling_phase_loss_logger(
         model_name=model_name,
         checkpoint_dir=checkpoint_dir,
         target_scaler=target_scaler,
+        exog_scaler=exog_scaler,
     )
 
 
@@ -438,15 +449,44 @@ class NeuralExecutor(BaseExecutor):
             self.context.split_data.train["y"].to_numpy(dtype=float),
         )
 
-    def _scale_target_df(self, df: pd.DataFrame, target_scaler: TargetScaler) -> pd.DataFrame:
+    def _active_exog_columns(self) -> list[str]:
+        return list(dict.fromkeys([*self.context.hist_exog, *self.context.futr_exog]))
+
+    def _build_exog_scaler(self) -> ExogScaler | None:
+        active_exog_columns = self._active_exog_columns()
+        if not active_exog_columns:
+            return None
+        return ExogScaler.fit(
+            train_df=self.context.split_data.train,
+            columns=active_exog_columns,
+        )
+
+    def _scale_target_df(
+        self,
+        df: pd.DataFrame,
+        target_scaler: TargetScaler,
+        exog_scaler: ExogScaler | None = None,
+    ) -> pd.DataFrame:
         scaled_df = df.copy()
         scaled_df["y"] = target_scaler.transform_values(scaled_df["y"].to_numpy(dtype=float))
+        if exog_scaler is not None:
+            scaled_df = exog_scaler.transform_frame(scaled_df)
         return scaled_df
 
     def _save_target_scaler_artifact(self, target_scaler: TargetScaler) -> str:
         scaler_path = self.context.artifact_dir / "target_scaler.json"
         scaler_path.write_text(
             json.dumps(target_scaler.to_dict(), indent=2),
+            encoding="utf-8",
+        )
+        return str(scaler_path)
+
+    def _save_exog_scaler_artifact(self, exog_scaler: ExogScaler | None) -> str | None:
+        if exog_scaler is None:
+            return None
+        scaler_path = self.context.artifact_dir / "exog_scaler.json"
+        scaler_path.write_text(
+            json.dumps(exog_scaler.to_dict(), indent=2),
             encoding="utf-8",
         )
         return str(scaler_path)
@@ -508,8 +548,14 @@ class NeuralExecutor(BaseExecutor):
         checkpoint_dir = self.context.artifact_dir / "checkpoints"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         target_scaler = self._build_target_scaler()
+        exog_scaler = self._build_exog_scaler()
         self._save_target_scaler_artifact(target_scaler)
-        scaled_trainval = self._scale_target_df(self.context.split_data.trainval, target_scaler)
+        self._save_exog_scaler_artifact(exog_scaler)
+        scaled_trainval = self._scale_target_df(
+            self.context.split_data.trainval,
+            target_scaler,
+            exog_scaler,
+        )
 
         csv_logger = CSVLogger(
             save_dir=str(self.context.artifact_dir),
@@ -531,6 +577,7 @@ class NeuralExecutor(BaseExecutor):
             model_name=self.model_name,
             checkpoint_dir=checkpoint_dir,
             target_scaler=target_scaler,
+            exog_scaler=exog_scaler,
         )
 
         neural_params = self._normalize_neural_params()
@@ -622,6 +669,7 @@ class NeuralExecutor(BaseExecutor):
             target_df=self.context.split_data.val,
             origins=self.context.split_data.val_origins,
             target_scaler=target_scaler,
+            exog_scaler=exog_scaler,
         )
 
         compare_test_phase = None
@@ -638,6 +686,7 @@ class NeuralExecutor(BaseExecutor):
             target_df=self.context.split_data.test,
             origins=self.context.split_data.test_origins,
             target_scaler=target_scaler,
+            exog_scaler=exog_scaler,
         )
 
         return ExecutorOutput(
@@ -718,6 +767,7 @@ class NeuralExecutor(BaseExecutor):
         target_df: pd.DataFrame,
         origins: list[int],
         target_scaler: TargetScaler | None = None,
+        exog_scaler: ExogScaler | None = None,
     ) -> PhaseOutput:
         return evaluate_phase_with_forecaster(
             context=self.context,
@@ -727,4 +777,5 @@ class NeuralExecutor(BaseExecutor):
             target_df=target_df,
             origins=origins,
             target_scaler=target_scaler,
+            exog_scaler=exog_scaler,
         )

@@ -72,6 +72,137 @@ class TargetScaler:
 
 
 @dataclass(frozen=True)
+class ExogScaler:
+    """Global exogenous-feature scaler fitted on training rows only."""
+
+    columns: tuple[str, ...]
+    features: dict[str, dict[str, float | str]]
+    n_train: int
+    eps: float = 1e-8
+
+    def __post_init__(self) -> None:
+        columns = tuple(self.columns)
+        n_train = int(self.n_train)
+        eps = float(self.eps)
+        if n_train <= 0:
+            raise ValueError("n_train must be positive")
+        if eps <= 0:
+            raise ValueError("eps must be positive")
+
+        normalized_features: dict[str, dict[str, float | str]] = {}
+        for column in columns:
+            if column not in self.features:
+                raise ValueError(f"missing exog scaler parameters for column {column!r}")
+            feature = dict(self.features[column])
+            mode = str(feature.get("mode", ""))
+            if mode not in {
+                "zscore",
+                "identity_binary",
+                "identity_cyclic",
+                "identity_constant",
+            }:
+                raise ValueError(f"unsupported exog scaler mode for column {column!r}: {mode!r}")
+            mean = float(feature.get("mean", 0.0))
+            std = float(feature.get("std", 0.0))
+            if not np.isfinite(mean):
+                raise ValueError(f"exog scaler mean must be finite for column {column!r}")
+            if not np.isfinite(std):
+                raise ValueError(f"exog scaler std must be finite for column {column!r}")
+            if mode == "zscore" and std <= eps:
+                raise ValueError(f"exog scaler std is zero or too close to zero for column {column!r}")
+            normalized_features[column] = {
+                "mode": mode,
+                "mean": mean,
+                "std": std,
+            }
+
+        object.__setattr__(self, "columns", columns)
+        object.__setattr__(self, "features", normalized_features)
+        object.__setattr__(self, "n_train", n_train)
+        object.__setattr__(self, "eps", eps)
+
+    @classmethod
+    def fit(
+        cls,
+        train_df: pd.DataFrame,
+        columns: Any,
+        eps: float = 1e-8,
+    ) -> "ExogScaler":
+        ordered_columns = tuple(dict.fromkeys(str(column) for column in columns))
+        n_train = int(len(train_df))
+        if n_train <= 0:
+            raise ValueError("training exog subset must not be empty")
+
+        missing_columns = [column for column in ordered_columns if column not in train_df.columns]
+        if missing_columns:
+            raise ValueError(f"training exog subset is missing columns: {missing_columns}")
+
+        features: dict[str, dict[str, float | str]] = {}
+        for column in ordered_columns:
+            series = train_df[column]
+            if not pd.api.types.is_numeric_dtype(series):
+                raise ValueError(f"exog column {column!r} must be numeric before scaling")
+            values = series.to_numpy(dtype=float)
+            if np.isnan(values).any():
+                raise ValueError(f"exog column {column!r} contains missing values")
+            if not np.isfinite(values).all():
+                raise ValueError(f"exog column {column!r} contains non-finite values")
+
+            mean = float(np.mean(values))
+            std = float(np.std(values))
+            if cls._is_cyclic_column(column):
+                mode = "identity_cyclic"
+            elif np.isin(values, [0.0, 1.0]).all():
+                mode = "identity_binary"
+            elif std <= float(eps):
+                mode = "identity_constant"
+            else:
+                mode = "zscore"
+            features[column] = {
+                "mode": mode,
+                "mean": mean,
+                "std": std,
+            }
+
+        return cls(
+            columns=ordered_columns,
+            features=features,
+            n_train=n_train,
+            eps=eps,
+        )
+
+    @staticmethod
+    def _is_cyclic_column(column: str) -> bool:
+        lower_column = str(column).lower()
+        return lower_column.endswith("_sin") or lower_column.endswith("_cos")
+
+    def transform_frame(self, df: pd.DataFrame) -> pd.DataFrame:
+        scaled_df = df.copy()
+        for column in self.columns:
+            if column not in scaled_df.columns:
+                continue
+            feature = self.features[column]
+            values = scaled_df[column].to_numpy(dtype=float)
+            if np.isnan(values).any():
+                raise ValueError(f"exog column {column!r} contains missing values")
+            if not np.isfinite(values).all():
+                raise ValueError(f"exog column {column!r} contains non-finite values")
+            if feature["mode"] == "zscore":
+                scaled_df[column] = (values - float(feature["mean"])) / float(feature["std"])
+            else:
+                scaled_df[column] = values
+        return scaled_df
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "columns": list(self.columns),
+            "features": self.features,
+            "n_train": self.n_train,
+            "eps": self.eps,
+        }
+
+
+@dataclass(frozen=True)
 class ForecastMetricCalculator:
     """Shared forecast metrics with train-standardized non-ratio losses."""
 

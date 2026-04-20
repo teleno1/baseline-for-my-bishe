@@ -9,7 +9,7 @@ import pandas as pd
 from ..config import ExperimentResult, ModelSpec, RunConfig
 from ..data import PreparedDataset
 from .artifacts import finalize_phase
-from .executors import BaseExecutor, MLExecutor, NeuralExecutor, StatsExecutor
+from .executors import BaseExecutor, MLExecutor, MLForecastExecutor, NeuralExecutor, StatsExecutor
 from .runtime import set_random_seed, suppress_lightning_logs
 from .types import ExecutionContext, SplitData
 
@@ -116,12 +116,13 @@ class RollingForecastRunner:
         executor_map: dict[str, type[BaseExecutor]] = {
             "stats": StatsExecutor,
             "ml": MLExecutor,
+            "mlforecast": MLForecastExecutor,
             "neural": NeuralExecutor,
         }
         return executor_map[context.model_spec.model_type](context=context)
 
     def _should_skip(self, model_spec: ModelSpec) -> bool:
-        if model_spec.model_type not in {"ml", "neural"}:
+        if model_spec.model_type not in {"ml", "mlforecast", "neural"}:
             return False
 
         requested_hist_exog = self.run_config.use_hist_exog and bool(self.prepared_dataset.hist_exog)
@@ -151,7 +152,7 @@ class RollingForecastRunner:
     def _resolve_hist_exog(self, model_spec: ModelSpec) -> list[str]:
         if not self.run_config.use_hist_exog:
             return []
-        if model_spec.model_type not in {"ml", "neural"}:
+        if model_spec.model_type not in {"ml", "mlforecast", "neural"}:
             return []
         if not model_spec.supports_hist_exog:
             return []
@@ -160,7 +161,7 @@ class RollingForecastRunner:
     def _resolve_future_exog(self, model_spec: ModelSpec) -> list[str]:
         if not self.run_config.use_futr_exog:
             return []
-        if model_spec.model_type not in {"ml", "neural"}:
+        if model_spec.model_type not in {"ml", "mlforecast", "neural"}:
             return []
         if not model_spec.supports_future_exog:
             return []

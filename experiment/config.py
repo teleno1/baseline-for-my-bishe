@@ -90,8 +90,8 @@ class ModelSpec:
     supports_future_exog: bool = True
 
     def __post_init__(self) -> None:
-        if self.model_type not in {"stats", "ml", "neural"}:
-            raise ValueError("model_type must be 'stats', 'ml', or 'neural'")
+        if self.model_type not in {"stats", "ml", "mlforecast", "neural"}:
+            raise ValueError("model_type must be 'stats', 'ml', 'mlforecast', or 'neural'")
 
 
 @dataclass
