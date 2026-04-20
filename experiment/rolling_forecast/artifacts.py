@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from ..config import RunConfig
-from .metrics import safe_mape
+from .metrics import TargetScaler, compute_plot_loss, format_plot_loss
 from .types import ExecutionContext, FinalizedPhase, PhaseOutput
 
 
@@ -250,6 +250,49 @@ def select_non_overlapping_windows(
     return selected_df
 
 
+def build_plot_target_scaler(context: ExecutionContext) -> TargetScaler | None:
+    """Fit the train-only target scaler when the selected plot metric needs it."""
+
+    if context.run_config.plot_loss_name == "MAPE":
+        return None
+    return TargetScaler.fit(context.split_data.train["y"].to_numpy(dtype=float))
+
+
+def compute_context_plot_loss(
+    context: ExecutionContext,
+    y_true: Any,
+    y_pred: Any,
+    target_scaler: TargetScaler | None,
+) -> float:
+    return compute_plot_loss(
+        y_true=y_true,
+        y_pred=y_pred,
+        loss_name=context.run_config.plot_loss_name,
+        target_scaler=target_scaler,
+    )
+
+
+def format_context_plot_loss(context: ExecutionContext, value: float) -> str:
+    return format_plot_loss(context.run_config.plot_loss_name, value)
+
+
+def compute_origin_plot_losses(
+    context: ExecutionContext,
+    diagnostics: dict[pd.Timestamp, dict[str, Any]],
+    target_scaler: TargetScaler | None,
+) -> pd.Series:
+    losses = {
+        pd.Timestamp(origin): compute_context_plot_loss(
+            context=context,
+            y_true=diagnostic["y_true"],
+            y_pred=diagnostic["y_pred"],
+            target_scaler=target_scaler,
+        )
+        for origin, diagnostic in diagnostics.items()
+    }
+    return pd.Series(losses, dtype=float).sort_index()
+
+
 def plot_test_overlay(
     context: ExecutionContext,
     target_df: pd.DataFrame,
@@ -272,6 +315,7 @@ def plot_test_overlay(
         window_size=context.run_config.horizon,
         window_step=context.run_config.horizon,
     )
+    target_scaler = build_plot_target_scaler(context)
 
     fig, ax = plt.subplots(figsize=(18, 6))
     ax.plot(
@@ -290,8 +334,13 @@ def plot_test_overlay(
             .sort_values("target_date")
             .reset_index(drop=True)
         )
-        group_mape = safe_mape(group_df["y_true"], group_df["y_pred"])
-        group_plot_label = f"{group_label} (MAPE={group_mape:.2f}%)"
+        group_loss = compute_context_plot_loss(
+            context=context,
+            y_true=group_df["y_true"],
+            y_pred=group_df["y_pred"],
+            target_scaler=target_scaler,
+        )
+        group_plot_label = f"{group_label} ({format_context_plot_loss(context, group_loss)})"
         ax.plot(
             group_df["target_date"],
             group_df["y_pred"],
@@ -339,13 +388,25 @@ def plot_test_forecast(
 ) -> Optional[str]:
     """Plot the best and worst rolling forecasts for the test phase."""
 
-    if not context.run_config.plot_forecast or best_origin is None or worst_origin is None:
+    if not context.run_config.plot_forecast or not diagnostics:
         return None
 
-    best = diagnostics[best_origin]
-    worst = diagnostics[worst_origin]
-    best_mape = safe_mape(best["y_true"], best["y_pred"])
-    worst_mape = safe_mape(worst["y_true"], worst["y_pred"])
+    target_scaler = build_plot_target_scaler(context)
+    origin_plot_losses = compute_origin_plot_losses(
+        context=context,
+        diagnostics=diagnostics,
+        target_scaler=target_scaler,
+    )
+    if origin_plot_losses.empty:
+        return None
+
+    plot_best_origin = pd.Timestamp(origin_plot_losses.idxmin())
+    plot_worst_origin = pd.Timestamp(origin_plot_losses.idxmax())
+    best = diagnostics[plot_best_origin]
+    worst = diagnostics[plot_worst_origin]
+    best_loss = float(origin_plot_losses.loc[plot_best_origin])
+    worst_loss = float(origin_plot_losses.loc[plot_worst_origin])
+    mean_plot_loss = float(origin_plot_losses.mean())
 
     plt.figure(figsize=(14, 5))
     plt.plot(
@@ -361,8 +422,8 @@ def plot_test_forecast(
         marker="o",
         linestyle="--",
         label=(
-            f"Best Forecast (origin={best_origin.date()}, "
-            f"MAPE={best_mape:.2f}%)"
+            f"Best Forecast (origin={plot_best_origin.date()}, "
+            f"{format_context_plot_loss(context, best_loss)})"
         ),
     )
     plt.plot(
@@ -371,8 +432,8 @@ def plot_test_forecast(
         marker="o",
         linestyle="--",
         label=(
-            f"Worst Forecast (origin={worst_origin.date()}, "
-            f"MAPE={worst_mape:.2f}%)"
+            f"Worst Forecast (origin={plot_worst_origin.date()}, "
+            f"{format_context_plot_loss(context, worst_loss)})"
         ),
     )
     checkpoint_suffix = f", from {checkpoint_label}" if checkpoint_label else ""
@@ -380,12 +441,14 @@ def plot_test_forecast(
         plt.title(
             f"Rolling Test Forecast ({context.model_name}{checkpoint_suffix})\n"
             f"Loss Function:{context.run_config.neural_loss_name},"
-            f"Horizon={context.run_config.horizon}, Mean Origin MAPE={overall_mape:.2f}%"
+            f"Horizon={context.run_config.horizon}, "
+            f"Mean Origin {format_context_plot_loss(context, mean_plot_loss)}"
         )
     else:
         plt.title(
             f"Rolling Test Forecast ({context.model_name}{checkpoint_suffix})\n"
-            f"Horizon={context.run_config.horizon}, Mean Origin MAPE={overall_mape:.2f}%"
+            f"Horizon={context.run_config.horizon}, "
+            f"Mean Origin {format_context_plot_loss(context, mean_plot_loss)}"
         )
     plt.xlabel("Date")
     plt.ylabel("Daily Electricity Load")

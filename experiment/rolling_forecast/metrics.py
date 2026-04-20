@@ -174,6 +174,47 @@ def safe_mape(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(np.mean(np.abs((true_values - pred_values) / denom)) * 100)
 
 
+def compute_plot_loss(
+    y_true: Any,
+    y_pred: Any,
+    loss_name: str,
+    target_scaler: TargetScaler | None = None,
+    eps: float = 1e-8,
+) -> float:
+    """Compute the window metric used by test-result visualizations."""
+
+    normalized_loss_name = str(loss_name).upper()
+    true_values = np.asarray(y_true, dtype=float)
+    pred_values = np.asarray(y_pred, dtype=float)
+    raw_error = pred_values - true_values
+
+    if normalized_loss_name == "MAPE":
+        denom = np.maximum(np.abs(true_values), float(eps))
+        return float(np.mean(np.abs(raw_error) / denom) * 100)
+
+    if target_scaler is None:
+        raise ValueError(f"target_scaler is required for plot_loss_name={normalized_loss_name!r}")
+
+    normalized_error = target_scaler.transform_error(raw_error)
+    if normalized_loss_name == "MAE":
+        return float(np.mean(np.abs(normalized_error)))
+    if normalized_loss_name == "MSE":
+        return float(np.mean(np.square(normalized_error)))
+
+    raise ValueError("plot_loss_name must be one of ('MAPE', 'MAE', 'MSE')")
+
+
+def format_plot_loss(loss_name: str, value: float) -> str:
+    """Format a visualization window metric for legends and titles."""
+
+    normalized_loss_name = str(loss_name).upper()
+    if normalized_loss_name == "MAPE":
+        return f"{normalized_loss_name}={value:.2f}%"
+    if normalized_loss_name in {"MAE", "MSE"}:
+        return f"{normalized_loss_name}={value:.4f}"
+    raise ValueError("plot_loss_name must be one of ('MAPE', 'MAE', 'MSE')")
+
+
 def summarize_cv_predictions(
     cv_df: pd.DataFrame,
     prediction_column: str,

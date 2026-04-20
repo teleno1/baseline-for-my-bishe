@@ -15,6 +15,7 @@ SUPPORTED_NEURAL_LOSS_NAMES = (
     "TukeyLoss",
     "MASE",
 )
+SUPPORTED_PLOT_LOSS_NAMES = ("MAPE", "MAE", "MSE")
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,7 @@ class RunConfig:
     save_dir: str = "./artifacts"
     plot_forecast: bool = True
     plot_loss: bool = True
+    plot_loss_name: str = "MAPE"
     freq: str = "D"
 
     def __post_init__(self) -> None:
@@ -61,6 +63,13 @@ class RunConfig:
             raise ValueError("neural_loss_params must be a dict")
         if self.neural_checkpoint_mode not in {"last", "val_best"}:
             raise ValueError("neural_checkpoint_mode must be 'last' or 'val_best'")
+        normalized_plot_loss_name = str(self.plot_loss_name).upper()
+        if normalized_plot_loss_name not in SUPPORTED_PLOT_LOSS_NAMES:
+            raise ValueError(
+                "plot_loss_name must be one of "
+                f"{SUPPORTED_PLOT_LOSS_NAMES}, got {self.plot_loss_name!r}"
+            )
+        object.__setattr__(self, "plot_loss_name", normalized_plot_loss_name)
 
     def normalized_split_ratio(self) -> tuple[float, float, float]:
         total = float(sum(self.split_ratio))
