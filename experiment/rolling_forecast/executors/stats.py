@@ -24,8 +24,9 @@ class StatsExecutor(BaseExecutor):
     def _cross_validate_phase(self, df: pd.DataFrame, test_size: int) -> PhaseOutput:
         from statsforecast import StatsForecast
 
+        model = self.context.model_spec.model_cls(**self.context.model_spec.model_params)
         sf = StatsForecast(
-            models=[self.context.model_spec.model_cls(**self.context.model_spec.model_params)],
+            models=[model],
             freq=self.context.run_config.freq,
             n_jobs=1,
         )
@@ -34,7 +35,7 @@ class StatsExecutor(BaseExecutor):
             h=self.context.run_config.horizon,
             test_size=test_size,
             step_size=self.context.run_config.sliding_step_size,
-            refit=False,
+            refit=self._cross_validation_refit(model),
         )
         prediction_column = self._prediction_column(
             cv_df,
@@ -45,3 +46,7 @@ class StatsExecutor(BaseExecutor):
             prediction_column=prediction_column,
         )
         return PhaseOutput(origin_mape_df=origin_mape_df, diagnostics=diagnostics)
+
+    @staticmethod
+    def _cross_validation_refit(model: object) -> bool:
+        return False if hasattr(model, "forward") else True
